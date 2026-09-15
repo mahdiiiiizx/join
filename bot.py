@@ -35,6 +35,8 @@
 import logging
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from supabase import create_client, Client
@@ -336,9 +338,13 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "menu_set_group":
         PENDING_GROUP_SET.add(user_id)
         await query.edit_message_text(
-            "ربات را در گروه مورد نظر ادمین کنید، سپس یک پیام از داخل همان گروه "
-            "فوروارد کنید و اینجا برای من ارسال کنید تا گروه ثبت شود.\n\n"
-            "(یا آیدی عددی گروه را مستقیماً ارسال کنید، مثل: -1001234567890)",
+            "ربات را در گروه مورد نظر ادمین کنید.\n\n"
+            "روش مطمئن: آیدی عددی گروه را مستقیماً اینجا ارسال کنید، مثل: "
+            "<code>-1001234567890</code>\n\n"
+            "(فوروارد پیام از گروه فقط زمانی جواب می‌دهد که پیام توسط "
+            "«ادمین ناشناس» ارسال شده باشد؛ برای پیام‌های عادی کاربران، تلگرام "
+            "دیگر چت مبدا را در فوروارد نشان نمی‌دهد.)",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")]]
             ),
@@ -444,12 +450,14 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in PENDING_GROUP_SET:
         PENDING_GROUP_SET.discard(user_id)
         chat_id = None
-        if message.forward_from_chat and message.forward_from_chat.type in (
-            Chat.GROUP,
-            Chat.SUPERGROUP,
-        ):
-            chat_id = message.forward_from_chat.id
-        elif message.text and re.match(r"^-?\d+$", message.text.strip()):
+        origin = message.forward_origin
+        if origin is not None:
+            # فوروارد گروه فقط زمانی چت مبدا را نشان می‌دهد که پیام توسط
+            # ادمین ناشناس ارسال شده باشد (MessageOriginChat)
+            origin_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+            if origin_chat is not None and origin_chat.type in (Chat.GROUP, Chat.SUPERGROUP):
+                chat_id = origin_chat.id
+        if chat_id is None and message.text and re.match(r"^-?\d+$", message.text.strip()):
             chat_id = int(message.text.strip())
 
         if chat_id is None:
@@ -473,8 +481,10 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in PENDING_CHANNEL_ADD:
         PENDING_CHANNEL_ADD.discard(user_id)
 
-        if message.forward_from_chat and message.forward_from_chat.type == Chat.CHANNEL:
-            fwd_chat = message.forward_from_chat
+        origin = message.forward_origin
+        origin_chat = getattr(origin, "chat", None) if origin is not None else None
+        if origin_chat is not None and origin_chat.type == Chat.CHANNEL:
+            fwd_chat = origin_chat
             try:
                 chat_full = await context.bot.get_chat(fwd_chat.id)
             except (BadRequest, Forbidden) as exc:
@@ -531,11 +541,41 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------------------------------------------------------------------------
 
 
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    """هندلر مینیمال HTTP فقط برای پاسخ به health check رندر."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        # جلوگیری از لاگ شدن هر ریکوئست health check روی stdout
+        pass
+
+
+def start_health_server() -> None:
+    """
+    Render برای وب‌سرویس‌ها انتظار دارد پورت باز باشد، وگرنه سرویس را
+    ناسالم/Timeout در نظر می‌گیرد. این تابع یک سرور HTTP سبک در یک ترد
+    جدا بالا می‌آورد که فقط به درخواست‌های health check پاسخ 200 می‌دهد؛
+    منطق اصلی ربات (polling) بدون تغییر در ترد اصلی اجرا می‌شود.
+    """
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("سرور health check روی پورت %s بالا آمد", port)
+
+
 def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
             "متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند."
         )
+
+    start_health_server()
 
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
