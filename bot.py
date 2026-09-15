@@ -1,24 +1,43 @@
 #!/usr/bin/env python3
 """
 ربات جوین اجباری تلگرام
-نیازمندی‌ها: python-telegram-bot==20.7  (پایتون 3.8+)
-نصب: pip install python-telegram-bot==20.7
+نیازمندی‌ها: python-telegram-bot==22.8  (پایتون 3.14+)
+دیتابیس: Supabase (Postgres)
+نصب: pip install -r requirements.txt
 
 ساختار:
-- فقط در یک گروه کار می‌کند (گروهی که مالک تنظیم می‌کند)
-- مالک از طریق پیوی ربات: گروه، کانال‌ها و متن پیام‌ها را مدیریت می‌کند
+- فقط در یک گروه کار می‌کند (گروهی که ادمین تنظیم می‌کند)
+- ادمین‌ها از طریق پیوی ربات: گروه، کانال‌ها و متن پیام‌ها را مدیریت می‌کنند
 - هر پیام در گروه چک عضویت در همه کانال‌ها انجام می‌شود
 - در صورت عدم عضویت: پیام حذف و پیام هشدار با دکمه‌های شیشه‌ای کانال‌ها ارسال می‌شود
 - با کلیک روی دکمه «بررسی عضویت» پیام ادیت شده و وضعیت «عضو شد» نمایش داده می‌شود
+
+جدول‌های مورد نیاز در Supabase (SQL):
+
+    create table if not exists settings (
+        key text primary key,
+        value text
+    );
+
+    create table if not exists channels (
+        id bigint generated always as identity primary key,
+        chat_id text not null unique,
+        title text not null,
+        invite_link text not null
+    );
+
+    create table if not exists texts (
+        key text primary key,
+        value text
+    );
 """
 
-import asyncio
 import logging
+import os
 import re
-import sqlite3
-from contextlib import closing
-from dataclasses import dataclass
 from typing import Optional
+
+from supabase import create_client, Client
 
 from telegram import (
     Update,
@@ -43,9 +62,13 @@ from telegram.ext import (
 # تنظیمات ثابت
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "8880674087:AAFSiRSHzq7vTMuMXIK7wGuZQVWdwfw92dc"
-OWNER_ID = 8977934490  # آیدی عددی مالک ربات (اجباری)
-DB_PATH = "forcejoin.db"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
+ADMIN_IDS = {601668306, 8977934490}
 
 DEFAULT_WARN_TEXT = (
     "کاربر {mention} \n"
@@ -60,60 +83,21 @@ logging.basicConfig(
 logger = logging.getLogger("forcejoin_bot")
 
 # ---------------------------------------------------------------------------
-# لایه دیتابیس
+# لایه دیتابیس (Supabase)
 # ---------------------------------------------------------------------------
 
-
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    with closing(db_connect()) as conn, conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                invite_link TEXT NOT NULL,
-                UNIQUE(chat_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS texts (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def get_setting(key: str) -> Optional[str]:
-    with closing(db_connect()) as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else None
+    res = supabase.table("settings").select("value").eq("key", key).execute()
+    if res.data:
+        return res.data[0]["value"]
+    return None
 
 
 def set_setting(key: str, value: str) -> None:
-    with closing(db_connect()) as conn, conn:
-        conn.execute(
-            "INSERT INTO settings(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+    supabase.table("settings").upsert({"key": key, "value": value}).execute()
 
 
 def get_group_id() -> Optional[int]:
@@ -126,41 +110,36 @@ def set_group_id(chat_id: int) -> None:
 
 
 def add_channel(chat_id: str, title: str, invite_link: str) -> None:
-    with closing(db_connect()) as conn, conn:
-        conn.execute(
-            "INSERT INTO channels(chat_id, title, invite_link) VALUES (?, ?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, invite_link = excluded.invite_link",
-            (chat_id, title, invite_link),
-        )
+    supabase.table("channels").upsert(
+        {"chat_id": chat_id, "title": title, "invite_link": invite_link},
+        on_conflict="chat_id",
+    ).execute()
 
 
 def remove_channel(identifier: str) -> bool:
-    with closing(db_connect()) as conn, conn:
-        cur = conn.execute(
-            "DELETE FROM channels WHERE chat_id = ? OR title = ?",
-            (identifier, identifier),
-        )
-        return cur.rowcount > 0
+    res = (
+        supabase.table("channels")
+        .delete()
+        .or_(f"chat_id.eq.{identifier},title.eq.{identifier}")
+        .execute()
+    )
+    return bool(res.data)
 
 
 def list_channels() -> list:
-    with closing(db_connect()) as conn:
-        return conn.execute("SELECT * FROM channels").fetchall()
+    res = supabase.table("channels").select("*").execute()
+    return res.data or []
 
 
 def get_text(key: str, default: str) -> str:
-    with closing(db_connect()) as conn:
-        row = conn.execute("SELECT value FROM texts WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
+    res = supabase.table("texts").select("value").eq("key", key).execute()
+    if res.data:
+        return res.data[0]["value"]
+    return default
 
 
 def set_text(key: str, value: str) -> None:
-    with closing(db_connect()) as conn, conn:
-        conn.execute(
-            "INSERT INTO texts(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
+    supabase.table("texts").upsert({"key": key, "value": value}).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +156,13 @@ def render_mention(user: User) -> str:
 
 def render_template(template: str, user: User) -> str:
     """
-    جایگزینی متغیرها در متن سفارشی مالک.
+    جایگزینی متغیرها در متن سفارشی ادمین.
     متغیرهای پشتیبانی‌شده: {mention} و منشن_کاربر (فرمت فارسی)
     """
     mention = render_mention(user)
     text = template.replace("{mention}", mention)
     text = text.replace("منشن_کاربر", mention)
-    # اگر مالک هیچ متغیری نگذاشته باشد، منشن اجباری در ابتدای پیام اضافه می‌شود
+    # اگر ادمین هیچ متغیری نگذاشته باشد، منشن اجباری در ابتدای پیام اضافه می‌شود
     if mention not in text:
         text = f"{mention}\n{text}"
     return text
@@ -193,8 +172,12 @@ def build_channels_keyboard(check_text: str = "✅ بررسی عضویت") -> In
     channels = list_channels()
     rows = []
     for ch in channels:
-        rows.append([InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch["invite_link"])])
-    rows.append([InlineKeyboardButton(text=check_text, callback_data="check_membership")])
+        rows.append(
+            [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch["invite_link"], style="primary")]
+        )
+    rows.append(
+        [InlineKeyboardButton(text=check_text, callback_data="check_membership", style="success")]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -217,16 +200,15 @@ async def is_member_of_all_channels(bot, user_id: int) -> bool:
     return True
 
 
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
-# ذخیره موقت پیام‌های در حال ادیت (مالک در حال ارسال متن جدید در پیوی)
+# ذخیره موقت پیام‌های در حال ادیت (ادمین در حال ارسال متن جدید در پیوی)
 PENDING_TEXT_EDIT: dict = {}
 PENDING_CHANNEL_ADD: set = set()
 PENDING_CHANNEL_REMOVE: set = set()
 PENDING_GROUP_SET: set = set()
-
 
 # ---------------------------------------------------------------------------
 # هندلرهای گروه
@@ -243,7 +225,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     group_id = get_group_id()
     if group_id is None or chat.id != group_id:
-        return  # ربات فقط در گروه تعیین‌شده توسط مالک فعال است
+        return  # ربات فقط در گروه تعیین‌شده توسط ادمین فعال است
 
     if not list_channels():
         return  # کانالی تنظیم نشده، محدودیتی اعمال نمی‌شود
@@ -294,31 +276,31 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# پنل مدیریت مالک (پیوی ربات)
+# پنل مدیریت ادمین (پیوی ربات)
 # ---------------------------------------------------------------------------
 
 MAIN_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🏠 تنظیم گروه", callback_data="menu_set_group")],
-        [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="menu_channels")],
-        [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="menu_texts")],
-        [InlineKeyboardButton("ℹ️ وضعیت فعلی", callback_data="menu_status")],
+        [InlineKeyboardButton("🏠 تنظیم گروه", callback_data="menu_set_group", style="primary")],
+        [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="menu_channels", style="primary")],
+        [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="menu_texts", style="primary")],
+        [InlineKeyboardButton("ℹ️ وضعیت فعلی", callback_data="menu_status", style="success")],
     ]
 )
 
 CHANNELS_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("➕ افزودن کانال", callback_data="ch_add")],
-        [InlineKeyboardButton("➖ حذف کانال", callback_data="ch_remove")],
-        [InlineKeyboardButton("📋 لیست کانال‌ها", callback_data="ch_list")],
+        [InlineKeyboardButton("➕ افزودن کانال", callback_data="ch_add", style="success")],
+        [InlineKeyboardButton("➖ حذف کانال", callback_data="ch_remove", style="danger")],
+        [InlineKeyboardButton("📋 لیست کانال‌ها", callback_data="ch_list", style="primary")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
     ]
 )
 
 TEXTS_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("✏️ ویرایش متن هشدار", callback_data="txt_warn")],
-        [InlineKeyboardButton("✏️ ویرایش متن تایید عضویت", callback_data="txt_joined")],
+        [InlineKeyboardButton("✏️ ویرایش متن هشدار", callback_data="txt_warn", style="primary")],
+        [InlineKeyboardButton("✏️ ویرایش متن تایید عضویت", callback_data="txt_joined", style="primary")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
     ]
 )
@@ -327,8 +309,8 @@ TEXTS_MENU = InlineKeyboardMarkup(
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != Chat.PRIVATE:
         return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("این ربات فقط توسط مالک قابل مدیریت است.")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("این ربات فقط توسط ادمین‌ها قابل مدیریت است.")
         return
     await update.message.reply_text(
         "به پنل مدیریت ربات جوین اجباری خوش آمدید 👋",
@@ -337,12 +319,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مدیریت کلیک‌های دکمه‌های پنل مالک در پیوی."""
+    """مدیریت کلیک‌های دکمه‌های پنل ادمین در پیوی."""
     query = update.callback_query
     user_id = query.from_user.id
 
-    if not is_owner(user_id):
-        await query.answer("شما مالک ربات نیستید.", show_alert=True)
+    if not is_admin(user_id):
+        await query.answer("شما ادمین ربات نیستید.", show_alert=True)
         return
 
     data = query.data
@@ -449,11 +431,11 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """پیام‌های متنی مالک در پیوی که برای مراحل pending استفاده می‌شوند."""
+    """پیام‌های متنی ادمین در پیوی که برای مراحل pending استفاده می‌شوند."""
     user = update.effective_user
     message = update.effective_message
 
-    if update.effective_chat.type != Chat.PRIVATE or not is_owner(user.id):
+    if update.effective_chat.type != Chat.PRIVATE or not is_admin(user.id):
         return
 
     user_id = user.id
@@ -550,7 +532,10 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def main() -> None:
-    init_db()
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError(
+            "متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند."
+        )
 
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
