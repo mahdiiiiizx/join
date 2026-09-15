@@ -43,8 +43,8 @@ from telegram.ext import (
 # تنظیمات ثابت
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
-OWNER_ID = 123456789  # آیدی عددی مالک ربات (اجباری)
+BOT_TOKEN = "8880674087:AAFSiRSHzq7vTMuMXIK7wGuZQVWdwfw92dc"
+OWNER_ID = 8977934490  # آیدی عددی مالک ربات (اجباری)
 DB_PATH = "forcejoin.db"
 
 DEFAULT_WARN_TEXT = (
