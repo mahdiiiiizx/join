@@ -77,7 +77,7 @@ from telegram import (
     User,
 )
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut, NetworkError
+from telegram.error import BadRequest, Conflict, Forbidden, TelegramError, TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -487,13 +487,15 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "ch_add":
         PENDING_ITEM_ADD.add(user_id)
         await query.edit_message_text(
-            "برای افزودن <b>کانال</b> یا <b>گروه</b>:\n"
-            "ربات را ادمین کنید، سپس یک پیام از آن کانال/گروه را فوروارد کنید.\n\n"
-            "یا به‌صورت دستی به این شکل ارسال کنید (هم برای لینک عمومی و هم لینک خصوصی کار می‌کند):\n"
-            "<code>@channel_username | https://t.me/channel_username</code>\n"
+            "برای افزودن <b>کانال</b> یا <b>گروه</b> (ربات باید ادمین آن باشد)، یکی از راه‌های زیر:\n\n"
+            "۱) فوروارد یک پیام از آن کانال/گروه\n"
+            "۲) ارسال مستقیم یوزرنیم: <code>@channel_username</code>\n"
+            "۳) ارسال مستقیم لینک عمومی: <code>https://t.me/channel_username</code>\n"
+            "۴) ارسال مستقیم آیدی عددی (اگر ربات از قبل عضو/ادمین آن است): <code>-1001234567890</code>\n\n"
+            "برای کانال/گروه <b>خصوصی</b> که فقط لینک دعوت (+…) دارید، لطفاً فوروارد کنید؛ "
+            "یا اگر آیدی عددی را می‌دانید:\n"
             "<code>-1001234567890 | https://t.me/+AbCdEfGhIj</code>\n\n"
-            "اگر لینک را ندارید و ربات ادمینِ کانال/گروهِ خصوصی است، فقط آیدی/فوروارد کافیست؛ "
-            "لینک به‌صورت خودکار ساخته می‌شود.",
+            "اگر لینک ندارید ولی ربات ادمین است، فقط یوزرنیم/آیدی/فوروارد کافیست؛ لینک خودکار ساخته می‌شود.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_channels"),
         )
@@ -606,6 +608,43 @@ def _extract_link_or_generate(chat_full, username: Optional[str]) -> Optional[st
     return None
 
 
+def parse_chat_ref(text: str):
+    """
+    تلاش برای استخراج یک شناسه‌ی قابل استفاده در get_chat از متن ورودی ادمین.
+    ورودی‌های پشتیبانی‌شده: @username ، t.me/username ، https://t.me/username ،
+    آیدی عددی (-100...) و یوزرنیم بدون @ .
+    خروجی: (ref, private_invite_link)
+        ref: چیزی که مستقیم می‌شود به get_chat داد (str یا int) یا None
+        private_invite_link: اگر ورودی یک لینک دعوت خصوصی (t.me/+... یا joinchat) بود،
+            همان لینک برگردانده می‌شود چون get_chat نمی‌تواند آن را resolve کند.
+    """
+    text = text.strip()
+    if not text:
+        return None, None
+
+    m = re.match(r"^(?:https?://)?t\.me/(\+|joinchat/)[\w-]+/?$", text, re.IGNORECASE)
+    if m:
+        return None, text
+
+    m = re.match(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{5,32})/?$", text, re.IGNORECASE)
+    if m:
+        return f"@{m.group(1)}", None
+
+    m = re.match(r"^@([A-Za-z0-9_]{5,32})$", text)
+    if m:
+        return text, None
+
+    m = re.match(r"^-?\d+$", text)
+    if m:
+        return int(text), None
+
+    m = re.match(r"^[A-Za-z0-9_]{5,32}$", text)
+    if m:
+        return f"@{text}", None
+
+    return None, None
+
+
 async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """پیام‌های متنی ادمین در پیوی که برای مراحل pending استفاده می‌شوند."""
     user = update.effective_user
@@ -625,8 +664,25 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             origin_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
             if origin_chat is not None and origin_chat.type in (Chat.GROUP, Chat.SUPERGROUP):
                 chat_id = origin_chat.id
-        if chat_id is None and message.text and re.match(r"^-?\d+$", message.text.strip()):
-            chat_id = int(message.text.strip())
+
+        if chat_id is None and message.text:
+            ref, private_link = parse_chat_ref(message.text)
+            if ref is not None:
+                try:
+                    chat_full = await context.bot.get_chat(ref)
+                except (BadRequest, Forbidden) as exc:
+                    await message.reply_text(f"خطا در دسترسی به گروه: {exc}")
+                    return
+                if chat_full.type not in (Chat.GROUP, Chat.SUPERGROUP):
+                    await message.reply_text("این یک گروه نیست. لطفاً لینک/آیدی/فوروارد یک گروه را ارسال کنید.")
+                    return
+                chat_id = chat_full.id
+            elif private_link is not None:
+                await message.reply_text(
+                    "لینک دعوت خصوصی را نمی‌توان مستقیماً resolve کرد. "
+                    "لطفاً آیدی عددی گروه را ارسال کنید یا پیامی از «ادمین ناشناس» در آن گروه را فوروارد کنید."
+                )
+                return
 
         if chat_id is None:
             await message.reply_text("ورودی نامعتبر است. دوباره تلاش کنید.")
@@ -649,16 +705,8 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in PENDING_ITEM_ADD:
         PENDING_ITEM_ADD.discard(user_id)
 
-        origin = message.forward_origin
-        origin_chat = getattr(origin, "chat", None) if origin is not None else None
-        if origin_chat is not None and origin_chat.type in (Chat.CHANNEL, Chat.GROUP, Chat.SUPERGROUP):
-            try:
-                chat_full = await context.bot.get_chat(origin_chat.id)
-            except (BadRequest, Forbidden) as exc:
-                await message.reply_text(f"خطا: {exc}")
-                return
-
-            invite_link = _extract_link_or_generate(chat_full, chat_full.username)
+        async def _finish_add(chat_full, forced_link: Optional[str] = None) -> None:
+            invite_link = forced_link or _extract_link_or_generate(chat_full, chat_full.username)
             if not invite_link:
                 try:
                     invite_link = await context.bot.export_chat_invite_link(chat_full.id)
@@ -668,25 +716,72 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                         f"مطمئن شوید ربات ادمین با دسترسی دعوت کاربران است. ({exc})"
                     )
                     return
-
             kind = "channel" if chat_full.type == Chat.CHANNEL else "group"
             add_item(kind, str(chat_full.id), chat_full.title, invite_link)
-            await message.reply_text(f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU)
+            await message.reply_text(
+                f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU
+            )
+
+        origin = message.forward_origin
+        origin_chat = getattr(origin, "chat", None) if origin is not None else None
+        if origin_chat is not None and origin_chat.type in (Chat.CHANNEL, Chat.GROUP, Chat.SUPERGROUP):
+            try:
+                chat_full = await context.bot.get_chat(origin_chat.id)
+            except (BadRequest, Forbidden) as exc:
+                await message.reply_text(f"خطا: {exc}")
+                return
+            await _finish_add(chat_full)
             return
 
-        if message.text and "|" in message.text:
-            chat_part, link_part = [p.strip() for p in message.text.split("|", 1)]
+        text = (message.text or "").strip()
+
+        if "|" in text:
+            chat_part, link_part = [p.strip() for p in text.split("|", 1)]
+            ref, _private_link = parse_chat_ref(chat_part)
+            if ref is None:
+                ref = chat_part  # اجازه بده get_chat خودش خطا بدهد اگر واقعاً نامعتبر بود
             try:
-                chat_full = await context.bot.get_chat(chat_part)
+                chat_full = await context.bot.get_chat(ref)
             except (BadRequest, Forbidden) as exc:
                 await message.reply_text(f"خطا در دسترسی: {exc}")
                 return
-            kind = "channel" if chat_full.type == Chat.CHANNEL else "group"
-            add_item(kind, str(chat_full.id), chat_full.title, link_part)
-            await message.reply_text(f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU)
+            if chat_full.type not in (Chat.CHANNEL, Chat.GROUP, Chat.SUPERGROUP):
+                await message.reply_text("این یک کانال یا گروه نیست.")
+                return
+            await _finish_add(chat_full, forced_link=link_part)
             return
 
-        await message.reply_text("فرمت نامعتبر است. دوباره تلاش کنید.")
+        # ورودی تک‌خطی: می‌تواند @username، لینک t.me عمومی یا آیدی عددی باشد
+        ref, private_link = parse_chat_ref(text)
+        if ref is not None:
+            try:
+                chat_full = await context.bot.get_chat(ref)
+            except (BadRequest, Forbidden) as exc:
+                await message.reply_text(f"خطا در دسترسی: {exc}")
+                return
+            if chat_full.type not in (Chat.CHANNEL, Chat.GROUP, Chat.SUPERGROUP):
+                await message.reply_text("این یک کانال یا گروه نیست.")
+                return
+            await _finish_add(chat_full)
+            return
+
+        if private_link is not None:
+            await message.reply_text(
+                "این یک لینک دعوت خصوصی است و ربات نمی‌تواند فقط از روی آن، کانال/گروه را resolve کند "
+                "(محدودیت API تلگرام). یکی از راه‌های زیر را امتحان کنید:\n\n"
+                "۱) ربات را ادمین آن کانال/گروه کنید و یک پیام از آن را برای من فوروارد کنید.\n"
+                "۲) اگر آیدی عددی کانال/گروه را می‌دانید، به این شکل بفرستید:\n"
+                f"<code>-1001234567890 | {private_link}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await message.reply_text(
+            "فرمت نامعتبر است. یکی از این‌ها را بفرستید: یوزرنیم (@channel)، لینک عمومی t.me/... ، "
+            "آیدی عددی، یا فوروارد یک پیام از آن کانال/گروه.\n\n"
+            "برای لینک خصوصی: <code>-1001234567890 | https://t.me/+AbCdEfGhIj</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     # حالت: افزودن ربات
@@ -736,6 +831,14 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """هندلر سراسری خطا؛ جلوگیری از کرش کل ربات به‌خاطر یک آپدیت خراب."""
+    if isinstance(context.error, Conflict):
+        logger.error(
+            "خطای Conflict: یک نمونه‌ی دیگر از همین ربات (همین توکن) هم‌زمان در حال polling است. "
+            "مطمئن شوید فقط یک instance از سرویس روی Render (یا هر جای دیگر) در حال اجراست "
+            "و دیپلوی قبلی کاملاً متوقف شده. این خطا خودش هیچ کرشی ایجاد نمی‌کند و ربات تلاش "
+            "می‌کند دوباره وصل شود."
+        )
+        return
     logger.error("خطای پردازش‌نشده: %s", context.error, exc_info=context.error)
 
 
