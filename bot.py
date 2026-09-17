@@ -136,8 +136,13 @@ def get_setting(key: str) -> Optional[str]:
     return _safe_db(_run, None)
 
 
-def set_setting(key: str, value: str) -> None:
-    _safe_db(lambda: supabase.table("settings").upsert({"key": key, "value": value}).execute())
+def set_setting(key: str, value: str) -> Optional[str]:
+    try:
+        supabase.table("settings").upsert({"key": key, "value": value}).execute()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام ذخیره تنظیمات: %s", exc)
+        return str(exc)
 
 
 def get_group_id() -> Optional[int]:
@@ -145,25 +150,30 @@ def get_group_id() -> Optional[int]:
     return int(val) if val else None
 
 
-def set_group_id(chat_id: int) -> None:
-    set_setting("group_id", str(chat_id))
+def set_group_id(chat_id: int) -> Optional[str]:
+    return set_setting("group_id", str(chat_id))
 
 
-def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> None:
-    _safe_db(
-        lambda: supabase.table("channels")
-        .upsert(
+def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Optional[str]:
+    """در صورت موفقیت None برمی‌گرداند، در صورت خطا متن خطا را برمی‌گرداند."""
+    try:
+        supabase.table("channels").upsert(
             {"kind": kind, "chat_id": chat_id, "title": title, "invite_link": invite_link},
             on_conflict="chat_id",
-        )
-        .execute()
-    )
+        ).execute()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام افزودن آیتم: %s", exc)
+        return str(exc)
 
 
-def update_item_link(item_id: int, invite_link: str) -> None:
-    _safe_db(
-        lambda: supabase.table("channels").update({"invite_link": invite_link}).eq("id", item_id).execute()
-    )
+def update_item_link(item_id: int, invite_link: str) -> Optional[str]:
+    try:
+        supabase.table("channels").update({"invite_link": invite_link}).eq("id", item_id).execute()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام ویرایش لینک: %s", exc)
+        return str(exc)
 
 
 def remove_item_by_id(item_id: int) -> bool:
@@ -191,8 +201,13 @@ def get_text(key: str, default: str) -> str:
     return _safe_db(_run, default)
 
 
-def set_text(key: str, value: str) -> None:
-    _safe_db(lambda: supabase.table("texts").upsert({"key": key, "value": value}).execute())
+def set_text(key: str, value: str) -> Optional[str]:
+    try:
+        supabase.table("texts").upsert({"key": key, "value": value}).execute()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام ذخیره متن: %s", exc)
+        return str(exc)
 
 
 def has_started_bot(bot_username: str, user_id: int) -> bool:
@@ -697,7 +712,13 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"خطا در دسترسی به گروه: {exc}")
             return
 
-        set_group_id(chat_id)
+        set_error = set_group_id(chat_id)
+        if set_error:
+            await message.reply_text(
+                f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{set_error}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
         await message.reply_text(f"گروه با آیدی {chat_id} ثبت شد ✅", reply_markup=MAIN_MENU)
         return
 
@@ -717,7 +738,15 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     return
             kind = "channel" if chat_full.type == Chat.CHANNEL else "group"
-            add_item(kind, str(chat_full.id), chat_full.title, invite_link)
+            err = add_item(kind, str(chat_full.id), chat_full.title, invite_link)
+            if err:
+                await message.reply_text(
+                    f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>\n\n"
+                    "احتمالاً جدول channels در Supabase ساختار درستی ندارد "
+                    "(نیاز به UNIQUE روی ستون chat_id دارد). از کوئری‌های ساخت جدول استفاده کنید.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
             await message.reply_text(
                 f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU
             )
@@ -799,7 +828,12 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 
         title = bot_chat.first_name or bot_chat.title or raw
         deep_link = f"https://t.me/{raw}?start=verify_join"
-        add_item("bot", raw, title, deep_link)
+        err = add_item("bot", raw, title, deep_link)
+        if err:
+            await message.reply_text(
+                f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
+            )
+            return
         await message.reply_text(
             f"ربات «{title}» اضافه شد ✅\n\n"
             "یادت نره: در هندلر /start همین ربات مقصد، یک ردیف در جدول bot_starts ثبت کن "
@@ -815,7 +849,10 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         if not new_link:
             await message.reply_text("لینک نامعتبر است.")
             return
-        update_item_link(item_id, new_link)
+        err = update_item_link(item_id, new_link)
+        if err:
+            await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
+            return
         item = get_item(item_id)
         await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU)
         return
@@ -824,7 +861,10 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in PENDING_TEXT_EDIT:
         key = PENDING_TEXT_EDIT.pop(user_id)
         new_text = message.text or ""
-        set_text(key, new_text)
+        err = set_text(key, new_text)
+        if err:
+            await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
+            return
         await message.reply_text("متن با موفقیت به‌روزرسانی شد ✅", reply_markup=TEXTS_MENU)
         return
 
