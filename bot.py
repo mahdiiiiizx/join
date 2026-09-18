@@ -174,6 +174,23 @@ async def set_group_id(chat_id: int) -> Optional[str]:
     return await set_setting("group_id", str(chat_id))
 
 
+DEFAULT_WARN_DELETE_SECONDS = 5
+
+
+async def get_warn_delete_seconds() -> float:
+    val = await get_setting("warn_delete_seconds")
+    if val is None:
+        return DEFAULT_WARN_DELETE_SECONDS
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return DEFAULT_WARN_DELETE_SECONDS
+
+
+async def set_warn_delete_seconds(seconds: float) -> Optional[str]:
+    return await set_setting("warn_delete_seconds", str(seconds))
+
+
 async def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Optional[str]:
     """در صورت موفقیت None برمی‌گرداند، در صورت خطا متن خطا را برمی‌گرداند."""
 
@@ -316,8 +333,8 @@ def build_items_keyboard(items: list, check_text: str = "✅ بررسی عضوی
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
-        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"])])
-    rows.append([InlineKeyboardButton(check_text, callback_data="check_membership")])
+        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
+    rows.append([InlineKeyboardButton(check_text, callback_data="check_membership", style="success")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -359,6 +376,20 @@ PENDING_ITEM_ADD: set = set()
 PENDING_BOT_ADD: set = set()
 PENDING_LINK_EDIT: dict = {}
 PENDING_GROUP_SET: set = set()
+PENDING_DELETE_TIMER_SET: set = set()
+
+
+async def _delete_message_after(bot, chat_id: int, message_id: int, delay: float) -> None:
+    """بعد از delay ثانیه، پیام را از گروه پاک می‌کند (برای پیام‌های هشدار جوین اجباری)."""
+    if delay <= 0:
+        return
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except (BadRequest, Forbidden) as exc:
+        logger.info("حذف خودکار پیام هشدار ناموفق بود (احتمالاً قبلاً حذف شده): %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("خطا در حذف خودکار پیام هشدار: %s", exc)
 
 # ---------------------------------------------------------------------------
 # هندلرهای گروه
@@ -394,7 +425,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     keyboard = build_items_keyboard(items)
 
     try:
-        await context.bot.send_message(
+        warn_msg = await context.bot.send_message(
             chat_id=chat.id,
             text=text,
             parse_mode=ParseMode.HTML,
@@ -403,6 +434,14 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
         logger.error("ارسال پیام هشدار ناموفق بود: %s", exc)
+        return
+
+    delay = await get_warn_delete_seconds()
+    if delay > 0:
+        task = asyncio.create_task(
+            _delete_message_after(context.bot, chat.id, warn_msg.message_id, delay)
+        )
+        task.add_done_callback(_log_task_exception)
 
 
 async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,26 +476,27 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 MAIN_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🏠 تنظیم گروه", callback_data="menu_set_group")],
-        [InlineKeyboardButton("📋 مدیریت آیتم‌ها", callback_data="menu_channels")],
-        [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="menu_texts")],
-        [InlineKeyboardButton("ℹ️ وضعیت فعلی", callback_data="menu_status")],
+        [InlineKeyboardButton("🏠 تنظیم گروه", callback_data="menu_set_group", style="primary")],
+        [InlineKeyboardButton("📋 مدیریت آیتم‌ها", callback_data="menu_channels", style="primary")],
+        [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="menu_texts", style="primary")],
+        [InlineKeyboardButton("⏱ زمان حذف پیام هشدار", callback_data="menu_delete_timer", style="primary")],
+        [InlineKeyboardButton("ℹ️ وضعیت فعلی", callback_data="menu_status", style="success")],
     ]
 )
 
 CHANNELS_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("➕ افزودن کانال/گروه", callback_data="ch_add")],
-        [InlineKeyboardButton("🤖 افزودن ربات", callback_data="ch_add_bot")],
-        [InlineKeyboardButton("📋 لیست کانال‌ها", callback_data="ch_list")],
+        [InlineKeyboardButton("➕ افزودن کانال/گروه", callback_data="ch_add", style="success")],
+        [InlineKeyboardButton("🤖 افزودن ربات", callback_data="ch_add_bot", style="success")],
+        [InlineKeyboardButton("📋 لیست کانال‌ها", callback_data="ch_list", style="primary")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
     ]
 )
 
 TEXTS_MENU = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("✏️ ویرایش متن هشدار", callback_data="txt_warn")],
-        [InlineKeyboardButton("✏️ ویرایش متن تایید عضویت", callback_data="txt_joined")],
+        [InlineKeyboardButton("✏️ ویرایش متن هشدار", callback_data="txt_warn", style="primary")],
+        [InlineKeyboardButton("✏️ ویرایش متن تایید عضویت", callback_data="txt_joined", style="primary")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
     ]
 )
@@ -470,16 +510,16 @@ def build_list_keyboard(items: list) -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
-        rows.append([InlineKeyboardButton(f"{icon} {it['title']}", callback_data=f"ch_view_{it['id']}")])
+        rows.append([InlineKeyboardButton(f"{icon} {it['title']}", callback_data=f"ch_view_{it['id']}", style="primary")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_channels")])
     return InlineKeyboardMarkup(rows)
 
 
 def build_item_manage_keyboard(item: dict, member_count_label: str = "👥 کاربران عضو شده") -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}")],
-        [InlineKeyboardButton(member_count_label, callback_data=f"ch_count_{item['id']}")],
-        [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}")],
+        [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
+        [InlineKeyboardButton(member_count_label, callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -640,12 +680,25 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=back_kb("menu_texts"),
         )
 
+    elif data == "menu_delete_timer":
+        PENDING_DELETE_TIMER_SET.add(user_id)
+        current = await get_warn_delete_seconds()
+        await query.edit_message_text(
+            f"زمان فعلی حذف خودکار پیام هشدار جوین اجباری: <b>{current:g} ثانیه</b>\n\n"
+            "عدد جدید (ثانیه) را ارسال کنید، مثلاً <code>5</code> یا <code>10</code>.\n"
+            "برای غیرفعال‌کردن حذف خودکار، عدد <code>0</code> را ارسال کنید.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb("menu_main"),
+        )
+
     elif data == "menu_status":
         group_id = await get_group_id()
         items = await list_items()
+        delete_seconds = await get_warn_delete_seconds()
         text = (
             f"گروه فعال: <code>{group_id if group_id else 'تنظیم نشده'}</code>\n"
-            f"تعداد آیتم‌ها: {len(items)}"
+            f"تعداد آیتم‌ها: {len(items)}\n"
+            f"زمان حذف پیام هشدار: {delete_seconds:g} ثانیه"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_kb("menu_main"))
 
@@ -890,6 +943,28 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             return
         item = await get_item(item_id)
         await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU)
+        return
+
+    # حالت: تنظیم زمان حذف خودکار پیام هشدار
+    if user_id in PENDING_DELETE_TIMER_SET:
+        PENDING_DELETE_TIMER_SET.discard(user_id)
+        raw = (message.text or "").strip().replace(",", ".")
+        try:
+            seconds = float(raw)
+            if seconds < 0:
+                raise ValueError
+        except ValueError:
+            await message.reply_text(
+                "عدد نامعتبر است. یک عدد غیرمنفی ارسال کنید (مثلاً 5 یا 0).",
+                reply_markup=back_kb("menu_main"),
+            )
+            return
+        err = await set_warn_delete_seconds(seconds)
+        if err:
+            await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
+            return
+        note = "حذف خودکار غیرفعال شد." if seconds == 0 else f"پیام‌های هشدار بعد از {seconds:g} ثانیه پاک می‌شوند."
+        await message.reply_text(f"ذخیره شد ✅\n{note}", reply_markup=MAIN_MENU)
         return
 
     # حالت: ویرایش متن‌ها
