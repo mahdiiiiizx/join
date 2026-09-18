@@ -67,7 +67,7 @@ from typing import Optional
 
 from aiohttp import web
 
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 from postgrest import SyncPostgrestClient  # noqa: F401  (فقط برای وضوح وابستگی)
 
 from telegram import (
@@ -118,7 +118,23 @@ logger = logging.getLogger("forcejoin_bot")
 # لایه دیتابیس (Supabase) — با هندل خطا تا یک خطای موقت دیتابیس ربات را نخواباند
 # ---------------------------------------------------------------------------
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# مهم: تمام تماس‌های supabase-py «سینک/بلاک‌کننده» هستند (روی httpx sync ساخته شده‌اند).
+# اگر این توابع مستقیم داخل هندلرهای async صدا زده شوند، هر تماس دیتابیس کل
+# event loop تک‌رشته‌ای aiohttp/PTB را برای مدت تایم‌اوت (یا حتی بی‌نهایت،
+# اگر شبکه هنگ کند) فریز می‌کند. در حالت وبهوک یعنی هیچ آپدیت دیگری از تلگرام
+# پردازش نمی‌شود؛ از بیرون دقیقاً همین‌طور دیده می‌شود: «Render روشن است ولی
+# ربات جواب نمی‌دهد». برای همین:
+#   ۱) روی کلاینت supabase یک تایم‌اوت صریح و معقول ست شده (به‌جای رفتار پیش‌فرض نامشخص).
+#   ۲) هر متد این لایه از asyncio.to_thread استفاده می‌کند تا تماس بلاک‌کننده
+#      در ترد جدا اجرا شود و event loop اصلی هیچ‌وقت قفل نشود.
+
+DB_TIMEOUT_SECONDS = 10
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    options=ClientOptions(postgrest_client_timeout=DB_TIMEOUT_SECONDS),
+)
 
 
 def _safe_db(fn, default=None):
@@ -129,89 +145,106 @@ def _safe_db(fn, default=None):
         return default
 
 
-def get_setting(key: str) -> Optional[str]:
+async def get_setting(key: str) -> Optional[str]:
     def _run():
         res = supabase.table("settings").select("value").eq("key", key).execute()
         return res.data[0]["value"] if res.data else None
 
-    return _safe_db(_run, None)
+    return await asyncio.to_thread(_safe_db, _run, None)
 
 
-def set_setting(key: str, value: str) -> Optional[str]:
-    try:
+async def set_setting(key: str, value: str) -> Optional[str]:
+    def _run():
         supabase.table("settings").upsert({"key": key, "value": value}).execute()
+
+    try:
+        await asyncio.to_thread(_run)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ذخیره تنظیمات: %s", exc)
         return str(exc)
 
 
-def get_group_id() -> Optional[int]:
-    val = get_setting("group_id")
+async def get_group_id() -> Optional[int]:
+    val = await get_setting("group_id")
     return int(val) if val else None
 
 
-def set_group_id(chat_id: int) -> Optional[str]:
-    return set_setting("group_id", str(chat_id))
+async def set_group_id(chat_id: int) -> Optional[str]:
+    return await set_setting("group_id", str(chat_id))
 
 
-def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Optional[str]:
+async def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Optional[str]:
     """در صورت موفقیت None برمی‌گرداند، در صورت خطا متن خطا را برمی‌گرداند."""
-    try:
+
+    def _run():
         supabase.table("channels").upsert(
             {"kind": kind, "chat_id": chat_id, "title": title, "invite_link": invite_link},
             on_conflict="chat_id",
         ).execute()
+
+    try:
+        await asyncio.to_thread(_run)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام افزودن آیتم: %s", exc)
         return str(exc)
 
 
-def update_item_link(item_id: int, invite_link: str) -> Optional[str]:
-    try:
+async def update_item_link(item_id: int, invite_link: str) -> Optional[str]:
+    def _run():
         supabase.table("channels").update({"invite_link": invite_link}).eq("id", item_id).execute()
+
+    try:
+        await asyncio.to_thread(_run)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ویرایش لینک: %s", exc)
         return str(exc)
 
 
-def remove_item_by_id(item_id: int) -> bool:
-    res = _safe_db(lambda: supabase.table("channels").delete().eq("id", item_id).execute())
+async def remove_item_by_id(item_id: int) -> bool:
+    res = await asyncio.to_thread(
+        _safe_db, lambda: supabase.table("channels").delete().eq("id", item_id).execute()
+    )
     return bool(res and res.data)
 
 
-def list_items() -> list:
-    res = _safe_db(lambda: supabase.table("channels").select("*").order("id").execute())
+async def list_items() -> list:
+    res = await asyncio.to_thread(
+        _safe_db, lambda: supabase.table("channels").select("*").order("id").execute()
+    )
     return res.data if res and res.data else []
 
 
-def get_item(item_id: int) -> Optional[dict]:
-    for it in list_items():
+async def get_item(item_id: int) -> Optional[dict]:
+    for it in await list_items():
         if it["id"] == item_id:
             return it
     return None
 
 
-def get_text(key: str, default: str) -> str:
+async def get_text(key: str, default: str) -> str:
     def _run():
         res = supabase.table("texts").select("value").eq("key", key).execute()
         return res.data[0]["value"] if res.data else default
 
-    return _safe_db(_run, default)
+    return await asyncio.to_thread(_safe_db, _run, default)
 
 
-def set_text(key: str, value: str) -> Optional[str]:
-    try:
+async def set_text(key: str, value: str) -> Optional[str]:
+    def _run():
         supabase.table("texts").upsert({"key": key, "value": value}).execute()
+
+    try:
+        await asyncio.to_thread(_run)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ذخیره متن: %s", exc)
         return str(exc)
 
 
-def has_started_bot(bot_username: str, user_id: int) -> bool:
+async def has_started_bot(bot_username: str, user_id: int) -> bool:
     def _run():
         res = (
             supabase.table("bot_starts")
@@ -222,15 +255,16 @@ def has_started_bot(bot_username: str, user_id: int) -> bool:
         )
         return bool(res.data)
 
-    return _safe_db(_run, False)
+    return await asyncio.to_thread(_safe_db, _run, False)
 
 
-def record_bot_start(bot_username: str, user_id: int) -> None:
-    _safe_db(
-        lambda: supabase.table("bot_starts")
-        .upsert({"bot_username": bot_username.lower(), "user_id": user_id})
-        .execute()
-    )
+async def record_bot_start(bot_username: str, user_id: int) -> None:
+    def _run():
+        supabase.table("bot_starts").upsert(
+            {"bot_username": bot_username.lower(), "user_id": user_id}
+        ).execute()
+
+    await asyncio.to_thread(_safe_db, _run)
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +303,8 @@ def build_items_list_text(items: list) -> str:
     return "\n".join(lines)
 
 
-def build_full_warn_text(user: User, items: list) -> str:
-    intro_template = get_text("warn_text", DEFAULT_WARN_TEXT)
+async def build_full_warn_text(user: User, items: list) -> str:
+    intro_template = await get_text("warn_text", DEFAULT_WARN_TEXT)
     intro = render_template(intro_template, user)
     items_text = build_items_list_text(items)
     if items_text:
@@ -291,7 +325,7 @@ async def _check_single_item(bot, item: dict, user_id: int) -> bool:
     kind = item.get("kind", "channel")
     try:
         if kind == "bot":
-            return await asyncio.to_thread(has_started_bot, item["chat_id"], user_id)
+            return await has_started_bot(item["chat_id"], user_id)
         member = await bot.get_chat_member(chat_id=item["chat_id"], user_id=user_id)
         return member.status in (
             ChatMemberStatus.MEMBER,
@@ -308,7 +342,7 @@ async def _check_single_item(bot, item: dict, user_id: int) -> bool:
 
 async def is_member_of_all_items(bot, user_id: int) -> bool:
     """بررسی موازی و سریع همه‌ی آیتم‌ها به‌جای حلقه‌ی ترتیبی."""
-    items = list_items()
+    items = await list_items()
     if not items:
         return True
     results = await asyncio.gather(*[_check_single_item(bot, it, user_id) for it in items])
@@ -339,11 +373,11 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if user is None or user.is_bot or message is None:
         return
 
-    group_id = get_group_id()
+    group_id = await get_group_id()
     if group_id is None or chat.id != group_id:
         return  # ربات فقط در گروه تعیین‌شده توسط ادمین فعال است
 
-    items = list_items()
+    items = await list_items()
     if not items:
         return  # هیچ آیتمی تنظیم نشده، محدودیتی اعمال نمی‌شود
 
@@ -356,7 +390,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except (BadRequest, Forbidden) as exc:
         logger.warning("عدم امکان حذف پیام: %s", exc)
 
-    text = build_full_warn_text(user, items)
+    text = await build_full_warn_text(user, items)
     keyboard = build_items_keyboard(items)
 
     try:
@@ -386,7 +420,7 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("هنوز در همه‌ی موارد عضو نشده‌اید ❌", show_alert=True)
         return
 
-    joined_template = get_text("joined_text", DEFAULT_JOINED_TEXT)
+    joined_template = await get_text("joined_text", DEFAULT_JOINED_TEXT)
     text = render_template(joined_template, user)
 
     try:
@@ -460,7 +494,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # این خط برای خودِ همین ربات هم ثبت می‌شود (در صورتی که این ربات خودش
     # به‌عنوان آیتم «ربات» در جای دیگری استفاده شود).
     if user is not None and context.bot.username:
-        await asyncio.to_thread(record_bot_start, context.bot.username, user.id)
+        await record_bot_start(context.bot.username, user.id)
 
     if not is_admin(user.id):
         await update.message.reply_text("این ربات فقط توسط ادمین‌ها قابل مدیریت است.")
@@ -528,7 +562,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     elif data == "ch_list":
-        items = list_items()
+        items = await list_items()
         if not items:
             await query.edit_message_text("هیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
         else:
@@ -536,7 +570,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data.startswith("ch_view_"):
         item_id = int(data.split("_")[-1])
-        item = get_item(item_id)
+        item = await get_item(item_id)
         if not item:
             await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
         else:
@@ -558,7 +592,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data.startswith("ch_count_"):
         item_id = int(data.split("_")[-1])
-        item = get_item(item_id)
+        item = await get_item(item_id)
         if not item:
             await query.answer("این آیتم دیگر وجود ندارد.", show_alert=True)
             return
@@ -573,8 +607,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data.startswith("ch_del_"):
         item_id = int(data.split("_")[-1])
-        removed = remove_item_by_id(item_id)
-        items = list_items()
+        removed = await remove_item_by_id(item_id)
+        items = await list_items()
         msg = "حذف شد ✅" if removed else "حذف نشد، دوباره تلاش کنید."
         if items:
             await query.edit_message_text(f"{msg}\n\nیکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items))
@@ -586,7 +620,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data == "txt_warn":
         PENDING_TEXT_EDIT[user_id] = "warn_text"
-        current = get_text("warn_text", DEFAULT_WARN_TEXT)
+        current = await get_text("warn_text", DEFAULT_WARN_TEXT)
         await query.edit_message_text(
             "متن فعلی هشدار عضویت (لیست کانال/گروه/ربات‌ها خودکار زیرش اضافه می‌شود):\n\n"
             f"<code>{current}</code>\n\n"
@@ -597,7 +631,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data == "txt_joined":
         PENDING_TEXT_EDIT[user_id] = "joined_text"
-        current = get_text("joined_text", DEFAULT_JOINED_TEXT)
+        current = await get_text("joined_text", DEFAULT_JOINED_TEXT)
         await query.edit_message_text(
             "متن فعلی تایید عضویت:\n\n"
             f"<code>{current}</code>\n\n"
@@ -607,8 +641,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     elif data == "menu_status":
-        group_id = get_group_id()
-        items = list_items()
+        group_id = await get_group_id()
+        items = await list_items()
         text = (
             f"گروه فعال: <code>{group_id if group_id else 'تنظیم نشده'}</code>\n"
             f"تعداد آیتم‌ها: {len(items)}"
@@ -713,7 +747,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"خطا در دسترسی به گروه: {exc}")
             return
 
-        set_error = set_group_id(chat_id)
+        set_error = await set_group_id(chat_id)
         if set_error:
             await message.reply_text(
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{set_error}</code>",
@@ -739,7 +773,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     return
             kind = "channel" if chat_full.type == Chat.CHANNEL else "group"
-            err = add_item(kind, str(chat_full.id), chat_full.title, invite_link)
+            err = await add_item(kind, str(chat_full.id), chat_full.title, invite_link)
             if err:
                 await message.reply_text(
                     f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>\n\n"
@@ -829,7 +863,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
 
         title = bot_chat.first_name or bot_chat.title or raw
         deep_link = f"https://t.me/{raw}?start=verify_join"
-        err = add_item("bot", raw, title, deep_link)
+        err = await add_item("bot", raw, title, deep_link)
         if err:
             await message.reply_text(
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
@@ -850,11 +884,11 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         if not new_link:
             await message.reply_text("لینک نامعتبر است.")
             return
-        err = update_item_link(item_id, new_link)
+        err = await update_item_link(item_id, new_link)
         if err:
             await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
             return
-        item = get_item(item_id)
+        item = await get_item(item_id)
         await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU)
         return
 
@@ -862,7 +896,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in PENDING_TEXT_EDIT:
         key = PENDING_TEXT_EDIT.pop(user_id)
         new_text = message.text or ""
-        err = set_text(key, new_text)
+        err = await set_text(key, new_text)
         if err:
             await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
             return
@@ -1008,10 +1042,35 @@ def main() -> None:
     asyncio.run(_run_with_processor())
 
 
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("خطای پردازش‌نشده در تسک آپدیت: %s", exc, exc_info=exc)
+
+
 async def _process_update_queue(application: Application) -> None:
+    """
+    مصرف‌کننده‌ی صف آپدیت‌ها. حیاتی‌ست که این حلقه هرگز کامل متوقف نشود، وگرنه
+    aiohttp همچنان سالم و 'روشن' جواب می‌دهد ولی هیچ آپدیتی از تلگرام دیگر
+    پردازش نمی‌شود (دقیقاً همان علامتی که گزارش شده: رندر روشن، ربات ساکت).
+    برای همین هر خطای احتمالی این‌جا catch می‌شود تا خودِ حلقه هیچ‌وقت نمیرد.
+    """
     while True:
-        update = await application.update_queue.get()
-        application.create_task(application.process_update(update))
+        try:
+            update = await application.update_queue.get()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("خطا در دریافت از صف آپدیت: %s", exc, exc_info=exc)
+            continue
+
+        try:
+            task = application.create_task(application.process_update(update))
+            task.add_done_callback(_log_task_exception)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("خطا در ایجاد تسک پردازش آپدیت: %s", exc, exc_info=exc)
 
 
 if __name__ == "__main__":
