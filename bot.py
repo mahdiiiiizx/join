@@ -44,18 +44,12 @@
     );
 
 نکته‌ی مهم درباره‌ی آیتم از نوع «ربات»:
-دکمه‌ی ربات یک دکمه‌ی لینک به آدرس خودِ همین ربات است (/go/...). وقتی کاربر می‌زند:
-  ۱) سرور همین ربات کلیک را می‌گیرد و یک ردیف در جدول bot_starts برای
-     (ربات مقصد، کاربر) ثبت می‌کند (یعنی کلیک = تایید عضویت)،
-  ۲) همان لحظه کاربر به t.me/BOT?start=... هدایت می‌شود و پیوی ربات مقصد باز می‌شود.
-نیازی به دیتابیس مشترک یا تغییر در ربات مقصد نیست.
-محدودیت: چون تلگرام راهی برای فهمیدن «Start واقعی» در ربات دیگر نمی‌دهد،
-تایید بر پایه‌ی کلیک است. برای کار کردن لینک‌ها WEBHOOK_SECRET را ثابت ست کنید.
+دکمه‌ی ربات یک لینک مستقیم به t.me/BOT?start=... است. بررسی واقعی ممکن نیست؛
+وقتی کاربر دکمه‌ی «بررسی عضویت» را می‌زند، ورود او به همه‌ی ربات‌ها تایید و در
+جدول bot_starts ثبت می‌شود. نیازی به تغییر در ربات مقصد یا دیتابیس مشترک نیست.
 """
 
 import asyncio
-import hashlib
-import hmac
 import html
 import logging
 import os
@@ -340,24 +334,11 @@ async def build_full_warn_text(user: User, items: list, use_default: bool = Fals
     return intro
 
 
-def _go_signature(item_id: int, user_id: int) -> str:
-    msg = f"{item_id}:{user_id}".encode()
-    return hmac.new(WEBHOOK_SECRET.encode(), msg, hashlib.sha256).hexdigest()[:16]
-
-
-def make_go_url(item_id: int, user_id: int) -> str:
-    return f"{BASE_URL}/go/{item_id}/{user_id}/{_go_signature(item_id, user_id)}"
-
-
 def build_items_keyboard(items: list, user_id: int, check_text: str = "✅ بررسی عضویت") -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
-        if it.get("kind") == "bot":
-            # دکمه‌ی لینک به آدرس خودِ ربات؛ آنجا کلیک ثبت و تایید می‌شود و کاربر به پیوی ربات مقصد هدایت می‌شود
-            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=make_go_url(it["id"], user_id), style="primary")])
-        else:
-            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
+        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
     rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}", style="success")])
     return InlineKeyboardMarkup(rows)
 
@@ -500,7 +481,12 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        missing = await get_missing_items(context.bot, user.id)
+        # ربات‌ها بررسی ندارند: زدن دکمه‌ی «بررسی عضویت» = تایید ورود به همه‌ی ربات‌ها
+        all_items = await list_items()
+        await asyncio.gather(
+            *[record_bot_start(it["chat_id"], user.id) for it in all_items if it.get("kind") == "bot"]
+        )
+        missing = await get_missing_items(context.bot, user.id, all_items)
     except Exception as exc:  # noqa: BLE001
         logger.error("خطا در بررسی عضویت: %s", exc)
         await query.answer("خطای موقت، دوباره تلاش کنید.", show_alert=True)
@@ -537,39 +523,6 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.info("ادیت پیام تایید ناموفق (use_default=%s): %s", use_default, exc)
 
     await query.answer("عضویت شما تایید شد ✅")
-
-
-async def on_bot_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """کلیک روی دکمه‌ی ربات = تایید عضویت در آن ربات + باز شدن پیوی ربات با لینک استارت."""
-    query = update.callback_query
-    user = query.from_user
-
-    parts = query.data.split("_")
-    try:
-        item_id = int(parts[1])
-    except (IndexError, ValueError):
-        await query.answer()
-        return
-
-    owner_part = parts[2] if len(parts) > 2 else ""
-    if not await _guard_button_owner(query, owner_part):
-        return
-
-    item = await get_item(item_id)
-    if not item or item.get("kind") != "bot":
-        await query.answer("این مورد دیگر وجود ندارد.", show_alert=True)
-        return
-
-    await record_bot_start(item["chat_id"], user.id)
-
-    try:
-        await query.answer(url=item["invite_link"])
-    except (BadRequest, TelegramError) as exc:
-        logger.warning("باز کردن لینک ربات ناموفق بود (%s): %s", item.get("chat_id"), exc)
-        try:
-            await query.answer("لینک ربات را از پیام باز کنید.", show_alert=True)
-        except TelegramError:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -699,8 +652,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "۱) یوزرنیم ربات: <code>@id_bot</code>\n"
             "۲) لینک ربات: <code>https://t.me/id_bot</code>\n"
             "۳) لینک دعوت با پارامتر استارت: <code>https://t.me/id_bot?start=ref123</code>\n\n"
-            "وقتی کاربر روی دکمه‌ی این ربات بزند، ابتدا عضویتش تایید و ثبت می‌شود و بلافاصله "
-            "به پیوی آن ربات هدایت می‌شود (دکمه‌ی Start با همان پارامتر آماده است). "
+            "دکمه‌ی این ربات یک لینک مستقیم است و کاربر با زدن آن به پیوی ربات هدایت می‌شود "
+            "(دکمه‌ی Start با همان پارامتر آماده است). ورودش وقتی تایید می‌شود که «بررسی عضویت» را بزند. "
             "نیازی به تغییر در ربات مقصد یا دیتابیس مشترک نیست.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_channels"),
@@ -743,7 +696,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         if item.get("kind") == "bot":
             clicks = await count_bot_starts(item["chat_id"])
-            await query.answer(f"تعداد کاربرانی که روی دکمه‌ی این ربات زده‌اند: {clicks}", show_alert=True)
+            await query.answer(f"تعداد کاربران تاییدشده برای این ربات: {clicks}", show_alert=True)
             return
         try:
             count = await context.bot.get_chat_member_count(item["chat_id"])
@@ -1045,7 +998,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(
             f"ربات «{title}» اضافه شد ✅\n"
             f"لینک استارت: {deep_link}\n\n"
-            "کلیک کاربر روی دکمه‌ی این ربات، عضویتش را تایید می‌کند.",
+            "با زدن «بررسی عضویت»، ورود کاربر به این ربات تایید می‌شود.",
             reply_markup=CHANNELS_MENU,
             disable_web_page_preview=True,
         )
@@ -1126,41 +1079,6 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL", "")).rstrip("/")
 
 
-async def _go_redirect(request: web.Request) -> web.Response:
-    """کلیک روی دکمه‌ی ربات: تایید عضویت کاربر در آن ربات + هدایت به پیوی ربات با لینک استارت."""
-    try:
-        item_id = int(request.match_info["item_id"])
-        user_id = int(request.match_info["user_id"])
-    except (KeyError, ValueError):
-        return web.Response(status=400, text="bad request")
-
-    signature = request.match_info.get("sig", "")
-    if not hmac.compare_digest(signature, _go_signature(item_id, user_id)):
-        return web.Response(status=403, text="forbidden")
-
-    item = await get_item(item_id)
-    if not item or item.get("kind") != "bot":
-        return web.Response(status=404, text="not found")
-
-    await record_bot_start(item["chat_id"], user_id)
-
-    target = item["invite_link"]
-    safe_target = html.escape(target, quote=True)
-    body = (
-        '<!doctype html><html><head><meta charset="utf-8">'
-        f'<meta http-equiv="refresh" content="0;url={safe_target}">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
-        f'<body><a href="{safe_target}">Open</a>'
-        f'<script>location.replace({target!r});</script></body></html>'
-    )
-    return web.Response(
-        status=302,
-        headers={"Location": target, "Cache-Control": "no-store"},
-        text=body,
-        content_type="text/html",
-    )
-
-
 async def _health(_request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
@@ -1234,7 +1152,6 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_cmd))
 
     application.add_handler(CallbackQueryHandler(on_check_membership, pattern=r"^check_membership(_\d+)?$"))
-    application.add_handler(CallbackQueryHandler(on_bot_link_click, pattern=r"^botgo_\d+(_\d+)?$"))
     application.add_handler(CallbackQueryHandler(owner_panel_router, pattern="^(menu_|ch_|txt_)"))
 
     application.add_handler(
@@ -1248,7 +1165,6 @@ def main() -> None:
     web_app["application"] = application
     web_app.router.add_get("/", _health)
     web_app.router.add_get("/healthz", _health)
-    web_app.router.add_get("/go/{item_id}/{user_id}/{sig}", _go_redirect)
     web_app.router.add_post(WEBHOOK_PATH, _telegram_webhook)
     web_app.on_startup.append(_on_startup)
     web_app.on_cleanup.append(_on_cleanup)
