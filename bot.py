@@ -25,8 +25,12 @@
         kind text not null default 'channel',   -- 'channel' | 'group' | 'bot'
         chat_id text not null unique,           -- آیدی عددی کانال/گروه یا یوزرنیم ربات (بدون @)
         title text not null,
-        invite_link text not null
+        invite_link text not null,
+        expires_at timestamptz                  -- زمان پایان جوین اجباریِ این آیتم (خالی = بدون محدودیت)
     );
+
+    -- اگر جدول channels را قبلاً ساخته‌اید، فقط این را اجرا کنید:
+    alter table channels add column if not exists expires_at timestamptz;
 
     create table if not exists texts (
         key text primary key,
@@ -56,6 +60,7 @@ import os
 import re
 import secrets
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from aiohttp import web
@@ -255,7 +260,7 @@ async def remove_item_by_id(item_id: int) -> bool:
     return bool(res and res.data)
 
 
-async def list_items() -> list:
+async def _fetch_items() -> list:
     hit, cached = _cache_get("items")
     if hit:
         return cached
@@ -269,11 +274,115 @@ async def list_items() -> list:
     return await asyncio.to_thread(_safe_db, _run, [])
 
 
+def _parse_ts(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def item_is_expired(item: dict) -> bool:
+    expires_at = _parse_ts(item.get("expires_at"))
+    return expires_at is not None and expires_at <= datetime.now(timezone.utc)
+
+
+def format_duration(delta: timedelta) -> str:
+    total = max(int(delta.total_seconds()), 0)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} روز")
+    if hours:
+        parts.append(f"{hours} ساعت")
+    if minutes and not days:
+        parts.append(f"{minutes} دقیقه")
+    return " و ".join(parts) if parts else "کمتر از یک دقیقه"
+
+
+def describe_item_schedule(item: dict) -> str:
+    expires_at = _parse_ts(item.get("expires_at"))
+    if expires_at is None:
+        return "فعال، بدون محدودیت زمانی"
+    if item_is_expired(item):
+        return "⛔️ منقضی شده (دیگر جوین اجباری نیست)"
+    return f"فعال، {format_duration(expires_at - datetime.now(timezone.utc))} دیگر باقی مانده"
+
+
+async def list_items() -> list:
+    """آیتم‌های فعالِ جوین اجباری (آیتم‌های منقضی‌شده حذف می‌شوند)."""
+    return [it for it in await _fetch_items() if not item_is_expired(it)]
+
+
+async def list_all_items() -> list:
+    """همه‌ی آیتم‌ها (شامل منقضی‌شده‌ها) برای پنل مدیریت."""
+    return await _fetch_items()
+
+
 async def get_item(item_id: int) -> Optional[dict]:
-    for it in await list_items():
+    for it in await list_all_items():
         if it["id"] == item_id:
             return it
     return None
+
+
+async def get_item_by_chat_id(chat_id: str) -> Optional[dict]:
+    for it in await list_all_items():
+        if str(it["chat_id"]) == str(chat_id):
+            return it
+    return None
+
+
+EXPIRES_AT_MISSING_HINT = (
+    "ستون expires_at در جدول channels وجود ندارد. این کوئری را در Supabase اجرا کنید:\n"
+    "alter table channels add column if not exists expires_at timestamptz;"
+)
+
+
+async def set_item_expiry(item_id: int, expires_at: Optional[datetime]) -> Optional[str]:
+    """expires_at=None یعنی فعال‌سازی هم‌اکنون بدون محدودیت زمانی. در صورت خطا متن خطا را برمی‌گرداند."""
+    value = expires_at.isoformat() if expires_at else None
+
+    def _run():
+        supabase.table("channels").update({"expires_at": value}).eq("id", item_id).execute()
+
+    try:
+        await asyncio.to_thread(_run)
+        _cache_clear()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام تنظیم زمان آیتم: %s", exc)
+        if "expires_at" in str(exc):
+            return EXPIRES_AT_MISSING_HINT
+        return str(exc)
+
+
+_PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+_DURATION_RE = re.compile(
+    r"(\d+)\s*(m|min|mins|minute|minutes|دقیقه|h|hr|hrs|hour|hours|ساعت|d|day|days|روز)?"
+)
+
+
+def parse_duration(text: str) -> Optional[timedelta]:
+    """مثال‌ها: 30m ، 12h ، 7d ، 90 دقیقه ، 2 روز ، فقط عدد = ساعت."""
+    match = _DURATION_RE.fullmatch(text.translate(_PERSIAN_DIGITS).strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2) or "h"
+    if unit.startswith(("m", "دقیقه")):
+        delta = timedelta(minutes=amount)
+    elif unit.startswith(("d", "روز")):
+        delta = timedelta(days=amount)
+    else:
+        delta = timedelta(hours=amount)
+    if delta <= timedelta(0) or delta > timedelta(days=3650):
+        return None
+    return delta
 
 
 async def get_text(key: str, default: str) -> str:
@@ -480,6 +589,7 @@ PENDING_TEXT_EDIT: dict = {}
 PENDING_ITEM_ADD: set = set()
 PENDING_BOT_ADD: set = set()
 PENDING_LINK_EDIT: dict = {}
+PENDING_ITEM_TIME: dict = {}   # user_id -> item_id (منتظر مدت زمان)
 PENDING_GROUP_SET: set = set()
 PENDING_DELETE_TIMER_SET: set = set()
 
@@ -800,6 +910,18 @@ TEXTS_MENU = InlineKeyboardMarkup(
 )
 
 
+def build_schedule_keyboard(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⚡ تنظیم هم اکنون", callback_data=f"ch_now_{item_id}", style="success"),
+                InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item_id}", style="primary"),
+            ],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_channels")],
+        ]
+    )
+
+
 def back_kb(callback_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback_data)]])
 
@@ -807,7 +929,7 @@ def back_kb(callback_data: str) -> InlineKeyboardMarkup:
 def build_list_keyboard(items: list) -> InlineKeyboardMarkup:
     rows = []
     for it in items:
-        icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
+        icon = "⛔️" if item_is_expired(it) else KIND_ICON.get(it.get("kind", "channel"), "📢")
         rows.append([InlineKeyboardButton(f"{icon} {it['title']}", callback_data=f"ch_view_{it['id']}", style="primary")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_channels")])
     return InlineKeyboardMarkup(rows)
@@ -815,6 +937,10 @@ def build_list_keyboard(items: list) -> InlineKeyboardMarkup:
 
 def build_item_manage_keyboard(item: dict, member_count_label: str = "👥 کاربران عضو شده") -> InlineKeyboardMarkup:
     rows = [
+        [
+            InlineKeyboardButton("⚡ تنظیم هم اکنون", callback_data=f"ch_now_{item['id']}", style="success"),
+            InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item['id']}", style="primary"),
+        ],
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
         [InlineKeyboardButton(member_count_label, callback_data=f"ch_count_{item['id']}", style="primary")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
@@ -854,6 +980,9 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     data = query.data
     await query.answer()
+
+    if not data.startswith("ch_time_"):
+        PENDING_ITEM_TIME.pop(user_id, None)
 
     if data == "menu_main":
         await query.edit_message_text("پنل مدیریت:", reply_markup=MAIN_MENU)
@@ -903,7 +1032,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     elif data == "ch_list":
-        items = await list_items()
+        items = await list_all_items()
         if not items:
             await query.edit_message_text("هیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
         else:
@@ -917,9 +1046,10 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             label = KIND_LABEL.get(item.get("kind", "channel"), "کانال")
             text = (
-                f"مدیریت {label}: <b>{item['title']}</b>\n"
+                f"مدیریت {label}: <b>{html.escape(item['title'])}</b>\n"
                 f"شناسه: <code>{item['chat_id']}</code>\n"
-                f"لینک: {item['invite_link']}"
+                f"لینک: {item['invite_link']}\n"
+                f"وضعیت: {describe_item_schedule(item)}"
             )
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item))
 
@@ -947,10 +1077,41 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
             await query.answer(f"خطا در دریافت تعداد اعضا: {exc}", show_alert=True)
 
+    elif data.startswith("ch_now_"):
+        item_id = int(data.split("_")[-1])
+        item = await get_item(item_id)
+        if not item:
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
+            return
+        PENDING_ITEM_TIME.pop(user_id, None)
+        err = await set_item_expiry(item_id, None)
+        if err:
+            await query.edit_message_text(f"❌ ذخیره نشد:\n{err}", reply_markup=back_kb(f"ch_view_{item_id}"))
+            return
+        await query.edit_message_text(
+            f"«{item['title']}» هم‌اکنون فعال شد و محدودیت زمانی ندارد ✅", reply_markup=CHANNELS_MENU
+        )
+
+    elif data.startswith("ch_time_"):
+        item_id = int(data.split("_")[-1])
+        item = await get_item(item_id)
+        if not item:
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
+            return
+        PENDING_ITEM_TIME[user_id] = item_id
+        await query.edit_message_text(
+            f"مدت فعال بودن جوین اجباریِ «{item['title']}» را بفرستید. بعد از این مدت، این مورد خودکار از جوین اجباری کنار می‌رود.\n\n"
+            "مثال‌ها: <code>30m</code> (دقیقه) ، <code>12h</code> (ساعت) ، <code>7d</code> (روز) ، "
+            "<code>90 دقیقه</code> ، <code>2 روز</code>\n"
+            "فقط عدد = ساعت.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(f"ch_view_{item_id}"),
+        )
+
     elif data.startswith("ch_del_"):
         item_id = int(data.split("_")[-1])
         removed = await remove_item_by_id(item_id)
-        items = await list_items()
+        items = await list_all_items()
         msg = "حذف شد ✅" if removed else "حذف نشد، دوباره تلاش کنید."
         if items:
             await query.edit_message_text(f"{msg}\n\nیکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items))
@@ -1139,9 +1300,17 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            await message.reply_text(
-                f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU
-            )
+            added = await get_item_by_chat_id(str(chat_full.id))
+            if added:
+                await message.reply_text(
+                    f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅\n\n"
+                    "همین حالا فعال شود یا برایش زمان تنظیم کنید؟",
+                    reply_markup=build_schedule_keyboard(added["id"]),
+                )
+            else:
+                await message.reply_text(
+                    f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU
+                )
 
         origin = message.forward_origin
         origin_chat = getattr(origin, "chat", None) if origin is not None else None
@@ -1238,12 +1407,35 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
             )
             return
+        added = await get_item_by_chat_id(username)
         await message.reply_text(
             f"ربات «{title}» اضافه شد ✅\n"
             f"لینک استارت: {deep_link}\n\n"
-            "با زدن «بررسی عضویت»، ورود کاربر به این ربات تایید می‌شود.",
-            reply_markup=CHANNELS_MENU,
+            "همین حالا فعال شود یا برایش زمان تنظیم کنید؟",
+            reply_markup=build_schedule_keyboard(added["id"]) if added else CHANNELS_MENU,
             disable_web_page_preview=True,
+        )
+        return
+
+    # حالت: تنظیم مدت فعال بودن آیتم
+    if user_id in PENDING_ITEM_TIME:
+        item_id = PENDING_ITEM_TIME[user_id]
+        delta = parse_duration(message.text or "")
+        if delta is None:
+            await message.reply_text(
+                "مدت نامعتبر است. مثال: 30m ، 12h ، 7d ، 90 دقیقه ، 2 روز (فقط عدد = ساعت). دوباره بفرستید."
+            )
+            return
+        PENDING_ITEM_TIME.pop(user_id, None)
+        err = await set_item_expiry(item_id, datetime.now(timezone.utc) + delta)
+        if err:
+            await message.reply_text(f"❌ ذخیره نشد:\n{err}")
+            return
+        item = await get_item(item_id)
+        await message.reply_text(
+            f"زمان تنظیم شد ✅ «{item['title'] if item else ''}» به مدت {format_duration(delta)} فعال است "
+            "و بعد از آن خودکار از جوین اجباری کنار می‌رود.",
+            reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU,
         )
         return
 
