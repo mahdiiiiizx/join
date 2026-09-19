@@ -497,12 +497,11 @@ async def build_full_warn_text(user: User, items: list, use_default: bool = Fals
     return intro
 
 
-def build_items_keyboard(items: list, user_id: int, check_text: str = "✅ بررسی عضویت") -> InlineKeyboardMarkup:
+def build_items_keyboard(items: list, user_id: int) -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
         rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"])])
-    rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -661,6 +660,32 @@ async def delete_message_reliably(message, attempts: int = 5) -> bool:
     return False
 
 
+ANONYMOUS_ADMIN_BOT_ID = 1087968824       # GroupAnonymousBot: پیام ادمینِ ناشناس
+GROUP_STAFF_TTL_SECONDS = 120.0
+_group_staff_cache: dict = {}             # user_id -> (زمان، ادمین/مالک گروه است؟)
+_bot_warned_users: set = set()            # کاربرانی که فقط آیتم «ربات» برایشان مانده و هشدار گرفته‌اند
+
+
+async def is_group_staff(bot, chat_id: int, user_id: int) -> bool:
+    """ادمین‌های ربات و ادمین/مالک گروه (با کش ۲ دقیقه‌ای)."""
+    if is_admin(user_id) or user_id == ANONYMOUS_ADMIN_BOT_ID:
+        return True
+    now = time.monotonic()
+    hit = _group_staff_cache.get(user_id)
+    if hit and now - hit[0] < GROUP_STAFF_TTL_SECONDS:
+        return hit[1]
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        staff = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+        logger.warning("بررسی ادمین بودن کاربر %s ممکن نبود: %s", user_id, exc)
+        return False
+    if len(_group_staff_cache) > 5000:
+        _group_staff_cache.clear()
+    _group_staff_cache[user_id] = (now, staff)
+    return staff
+
+
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
@@ -673,12 +698,25 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if group_id is None or chat.id != group_id:
         return  # ربات فقط در گروه تعیین‌شده توسط ادمین فعال است
 
+    if message.sender_chat is not None:
+        return  # ادمینِ ناشناس (پیام به نام گروه) یا پست کانالِ متصل: هیچ‌وقت بررسی نمی‌شود
+    if await is_group_staff(context.bot, chat.id, user.id):
+        return  # مالک و ادمین‌های گروه/ربات: پیام‌هایشان خوانده و حذف نمی‌شود
+
     items = await list_items()
     if not items:
         return  # هیچ آیتمی تنظیم نشده، محدودیتی اعمال نمی‌شود
 
     missing = await get_missing_items_fast(context.bot, user.id, items)
     if not missing:
+        return
+
+    bot_only_missing = all(it.get("kind") == "bot" for it in missing)
+    if bot_only_missing and user.id in _bot_warned_users:
+        # بررسی واقعی ورود به ربات ممکن نیست؛ بدون دکمه‌ی تایید، پیام بعد از هشدار = تایید خودکار
+        _bot_warned_users.discard(user.id)
+        await asyncio.gather(*[record_bot_start(it["chat_id"], user.id) for it in missing])
+        _membership_cache.pop(user.id, None)
         return
 
     # اول حذف (هر پیام مستقل و هم‌زمان با بقیه‌ی پیام‌های همان کاربر)، بعد هشدار
@@ -729,6 +767,10 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
         if warn_msg is None:
             return
+        if bot_only_missing:
+            if len(_bot_warned_users) > 5000:
+                _bot_warned_users.clear()
+            _bot_warned_users.add(user.id)
         # با حذف پیام هشدار (بعد از تایمر) این وضعیت آزاد می‌شود و پیام بعدیِ کاربر هشدار جدید می‌گیرد
         expires_in = delay + 15.0 if delay > 0 else 3600.0
         _active_warn[user.id] = (warn_msg.message_id, time.monotonic() + expires_in, chat.id)
