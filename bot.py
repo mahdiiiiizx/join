@@ -55,6 +55,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from typing import Optional
 
 from aiohttp import web
@@ -70,7 +71,7 @@ from telegram import (
     User,
 )
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Conflict, Forbidden, TelegramError, TimedOut, NetworkError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -137,10 +138,40 @@ def _safe_db(fn, default=None):
         return default
 
 
+# کش کوتاه‌مدت: هر پیام گروه قبلاً چندین تماس دیتابیس (گروه، آیتم‌ها، متن‌ها، ...) می‌زد و
+# تماس‌ها در ترد‌های محدود صف می‌کشیدند؛ همین باعث کندی حذف پیام‌ها در حالت هجوم پیام بود.
+# کش فقط نتیجه‌ی موفق را نگه می‌دارد و با هر تغییر ادمین بلافاصله پاک می‌شود.
+CACHE_TTL_SECONDS = 15.0
+_db_cache: dict = {}
+
+
+def _cache_get(key: str):
+    hit = _db_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < CACHE_TTL_SECONDS:
+        return True, hit[1]
+    return False, None
+
+
+def _cache_put(key: str, value) -> None:
+    _db_cache[key] = (time.monotonic(), value)
+
+
+def _cache_clear() -> None:
+    _db_cache.clear()
+    _membership_cache.clear()
+
+
 async def get_setting(key: str) -> Optional[str]:
+    hit, cached = _cache_get(f"setting:{key}")
+    if hit:
+        return cached
+
     def _run():
         res = supabase.table("settings").select("value").eq("key", key).execute()
-        return res.data[0]["value"] if res.data else None
+        value = res.data[0]["value"] if res.data else None
+        if value is not None:
+            _cache_put(f"setting:{key}", value)
+        return value
 
     return await asyncio.to_thread(_safe_db, _run, None)
 
@@ -151,6 +182,7 @@ async def set_setting(key: str, value: str) -> Optional[str]:
 
     try:
         await asyncio.to_thread(_run)
+        _cache_clear()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ذخیره تنظیمات: %s", exc)
@@ -194,6 +226,7 @@ async def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Opt
 
     try:
         await asyncio.to_thread(_run)
+        _cache_clear()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام افزودن آیتم: %s", exc)
@@ -206,6 +239,7 @@ async def update_item_link(item_id: int, invite_link: str) -> Optional[str]:
 
     try:
         await asyncio.to_thread(_run)
+        _cache_clear()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ویرایش لینک: %s", exc)
@@ -216,14 +250,22 @@ async def remove_item_by_id(item_id: int) -> bool:
     res = await asyncio.to_thread(
         _safe_db, lambda: supabase.table("channels").delete().eq("id", item_id).execute()
     )
+    _cache_clear()
     return bool(res and res.data)
 
 
 async def list_items() -> list:
-    res = await asyncio.to_thread(
-        _safe_db, lambda: supabase.table("channels").select("*").order("id").execute()
-    )
-    return res.data if res and res.data else []
+    hit, cached = _cache_get("items")
+    if hit:
+        return cached
+
+    def _run():
+        res = supabase.table("channels").select("*").order("id").execute()
+        items = res.data or []
+        _cache_put("items", items)
+        return items
+
+    return await asyncio.to_thread(_safe_db, _run, [])
 
 
 async def get_item(item_id: int) -> Optional[dict]:
@@ -234,9 +276,15 @@ async def get_item(item_id: int) -> Optional[dict]:
 
 
 async def get_text(key: str, default: str) -> str:
+    hit, cached = _cache_get(f"text:{key}")
+    if hit:
+        return cached
+
     def _run():
         res = supabase.table("texts").select("value").eq("key", key).execute()
-        return res.data[0]["value"] if res.data else default
+        value = res.data[0]["value"] if res.data else default
+        _cache_put(f"text:{key}", value)
+        return value
 
     return await asyncio.to_thread(_safe_db, _run, default)
 
@@ -247,6 +295,7 @@ async def set_text(key: str, value: str) -> Optional[str]:
 
     try:
         await asyncio.to_thread(_run)
+        _cache_clear()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.error("خطای دیتابیس هنگام ذخیره متن: %s", exc)
@@ -372,6 +421,46 @@ async def get_missing_items(bot, user_id: int, items: Optional[list] = None) -> 
     return [it for it, ok in zip(items, results) if not ok]
 
 
+MEMBERSHIP_OK_TTL_SECONDS = 20.0    # کاربری که همه‌چیز را کامل دارد: ۲۰ ثانیه دوباره چک نمی‌شود
+MEMBERSHIP_MISS_TTL_SECONDS = 3.0   # کاربر ناقص: فقط برای هجوم پیام‌های هم‌زمان (چند ثانیه) کش می‌شود
+_membership_cache: dict = {}        # user_id -> (زمان، مجموعه‌ی id آیتم‌های ناقص)
+_membership_inflight: dict = {}     # user_id -> تسک در حال اجرای بررسی
+
+
+def store_membership(user_id: int, missing: list) -> None:
+    if len(_membership_cache) > 5000:
+        _membership_cache.clear()
+    _membership_cache[user_id] = (time.monotonic(), {it["id"] for it in missing})
+
+
+async def get_missing_items_fast(bot, user_id: int, items: list) -> list:
+    """
+    نسخه‌ی سریع برای پیام‌های گروه: نتیجه‌ی اخیر را از کش می‌خواند و اگر چند پیام هم‌زمان
+    از یک کاربر برسد، فقط یک بار get_chat_member می‌زند و همه از همان نتیجه استفاده می‌کنند.
+    """
+    hit = _membership_cache.get(user_id)
+    if hit is not None:
+        ts, missing_ids = hit
+        ttl = MEMBERSHIP_MISS_TTL_SECONDS if missing_ids else MEMBERSHIP_OK_TTL_SECONDS
+        if time.monotonic() - ts < ttl:
+            return [it for it in items if it["id"] in missing_ids]
+
+    task = _membership_inflight.get(user_id)
+    if task is None:
+        task = asyncio.ensure_future(get_missing_items(bot, user_id, items))
+        _membership_inflight[user_id] = task
+
+        def _cleanup(t: asyncio.Future, uid: int = user_id) -> None:
+            if _membership_inflight.get(uid) is t:
+                _membership_inflight.pop(uid, None)
+
+        task.add_done_callback(_cleanup)
+
+    missing = await asyncio.shield(task)
+    store_membership(user_id, missing)
+    return missing
+
+
 async def is_member_of_all_items(bot, user_id: int) -> bool:
     """بررسی موازی و سریع همه‌ی آیتم‌ها به‌جای حلقه‌ی ترتیبی."""
     items = await list_items()
@@ -394,8 +483,8 @@ PENDING_GROUP_SET: set = set()
 PENDING_DELETE_TIMER_SET: set = set()
 
 
-async def _delete_message_after(bot, chat_id: int, message_id: int, delay: float) -> None:
-    """بعد از delay ثانیه، پیام را از گروه پاک می‌کند (برای پیام‌های هشدار جوین اجباری)."""
+async def _delete_message_after(bot, chat_id: int, message_id: int, delay: float, user_id: Optional[int] = None) -> None:
+    """بعد از delay ثانیه، پیام هشدار را پاک می‌کند و به کاربر اجازه می‌دهد اگر هنوز عضو نیست، هشدار جدید بگیرد."""
     if delay <= 0:
         return
     try:
@@ -405,10 +494,56 @@ async def _delete_message_after(bot, chat_id: int, message_id: int, delay: float
         logger.info("حذف خودکار پیام هشدار ناموفق بود (احتمالاً قبلاً حذف شده): %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.warning("خطا در حذف خودکار پیام هشدار: %s", exc)
+    finally:
+        if user_id is not None:
+            active = _active_warn.get(user_id)
+            if active is not None and active[0] == message_id:
+                _active_warn.pop(user_id, None)
 
 # ---------------------------------------------------------------------------
 # هندلرهای گروه
 # ---------------------------------------------------------------------------
+
+
+_warn_locks: dict = {}    # user_id -> Lock (فقط یک هشدار هم‌زمان برای هر کاربر)
+_active_warn: dict = {}   # user_id -> (message_id هشدار فعال، زمان انقضای اطمینان)
+
+
+def _get_warn_lock(user_id: int) -> asyncio.Lock:
+    if len(_warn_locks) > 2000:
+        for uid in [u for u, lk in _warn_locks.items() if not lk.locked()]:
+            _warn_locks.pop(uid, None)
+            _active_warn.pop(uid, None)
+    lock = _warn_locks.get(user_id)
+    if lock is None:
+        lock = _warn_locks[user_id] = asyncio.Lock()
+    return lock
+
+
+async def delete_message_reliably(message, attempts: int = 5) -> bool:
+    """حذف پیام با تلاش مجدد روی محدودیت نرخ (RetryAfter) و خطای شبکه؛ قبلاً همین خطاها باعث می‌شد بعضی پیام‌ها پاک نشوند."""
+    for attempt in range(attempts):
+        try:
+            await message.delete()
+            return True
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            logger.warning("محدودیت نرخ هنگام حذف پیام؛ %.1f ثانیه صبر و تلاش مجدد", wait)
+            await asyncio.sleep(wait + 0.2)
+        except (TimedOut, NetworkError) as exc:
+            logger.warning("خطای شبکه هنگام حذف پیام (تلاش %d): %s", attempt + 1, exc)
+            await asyncio.sleep(0.3 * (attempt + 1))
+        except BadRequest as exc:
+            if "not found" in str(exc).lower():
+                return True  # قبلاً حذف شده
+            logger.warning("عدم امکان حذف پیام: %s", exc)
+            return False
+        except Forbidden as exc:
+            logger.warning("ربات اجازه‌ی حذف پیام ندارد: %s", exc)
+            return False
+    logger.error("حذف پیام بعد از %d تلاش ناموفق بود", attempts)
+    return False
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -427,40 +562,65 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not items:
         return  # هیچ آیتمی تنظیم نشده، محدودیتی اعمال نمی‌شود
 
-    missing = await get_missing_items(context.bot, user.id, items)
+    missing = await get_missing_items_fast(context.bot, user.id, items)
     if not missing:
         return
 
-    try:
-        await message.delete()
-    except (BadRequest, Forbidden) as exc:
-        logger.warning("عدم امکان حذف پیام: %s", exc)
-
-    keyboard = build_items_keyboard(missing, user.id)
-    warn_msg = None
-    for use_default in (False, True):
-        text = await build_full_warn_text(user, missing, use_default=use_default)
-        try:
-            warn_msg = await context.bot.send_message(
-                chat_id=chat.id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-            break
-        except BadRequest as exc:
-            logger.error("ارسال پیام هشدار ناموفق بود (use_default=%s): %s", use_default, exc)
-        except (Forbidden, TimedOut, NetworkError) as exc:
-            logger.error("ارسال پیام هشدار ناموفق بود: %s", exc)
-            return
-    if warn_msg is None:
-        return
+    # اول حذف (هر پیام مستقل و هم‌زمان با بقیه‌ی پیام‌های همان کاربر)، بعد هشدار
+    await delete_message_reliably(message)
 
     delay = await get_warn_delete_seconds()
+
+    async with _get_warn_lock(user.id):
+        active = _active_warn.get(user.id)
+        if active is not None:
+            if time.monotonic() < active[1]:
+                return  # هشدار این کاربر هنوز در گروه است؛ پیام‌ها فقط پاک می‌شوند، هشدار تکراری نمی‌رود
+            _active_warn.pop(user.id, None)  # حالت اطمینان: انقضا (مثلاً تسک حذف از بین رفته)
+
+        keyboard = build_items_keyboard(missing, user.id)
+        warn_msg = None
+        for use_default in (False, True):
+            text = await build_full_warn_text(user, missing, use_default=use_default)
+            try:
+                warn_msg = await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                break
+            except RetryAfter as exc:
+                wait = exc.retry_after
+                wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+                await asyncio.sleep(wait + 0.2)
+                try:
+                    warn_msg = await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                    break
+                except TelegramError as exc2:
+                    logger.error("ارسال پیام هشدار ناموفق بود: %s", exc2)
+                    return
+            except BadRequest as exc:
+                logger.error("ارسال پیام هشدار ناموفق بود (use_default=%s): %s", use_default, exc)
+            except (Forbidden, TimedOut, NetworkError) as exc:
+                logger.error("ارسال پیام هشدار ناموفق بود: %s", exc)
+                return
+        if warn_msg is None:
+            return
+        # با حذف پیام هشدار (بعد از تایمر) این وضعیت آزاد می‌شود و پیام بعدیِ کاربر هشدار جدید می‌گیرد
+        expires_in = delay + 15.0 if delay > 0 else 3600.0
+        _active_warn[user.id] = (warn_msg.message_id, time.monotonic() + expires_in)
+
     if delay > 0:
         task = asyncio.create_task(
-            _delete_message_after(context.bot, chat.id, warn_msg.message_id, delay)
+            _delete_message_after(context.bot, chat.id, warn_msg.message_id, delay, user.id)
         )
         task.add_done_callback(_log_task_exception)
 
@@ -487,6 +647,9 @@ async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE
             *[record_bot_start(it["chat_id"], user.id) for it in all_items if it.get("kind") == "bot"]
         )
         missing = await get_missing_items(context.bot, user.id, all_items)
+        store_membership(user.id, missing)
+        if not missing:
+            _active_warn.pop(user.id, None)
     except Exception as exc:  # noqa: BLE001
         logger.error("خطا در بررسی عضویت: %s", exc)
         await query.answer("خطای موقت، دوباره تلاش کنید.", show_alert=True)
@@ -1111,6 +1274,7 @@ async def _on_startup(app: web.Application) -> None:
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
         allowed_updates=Update.ALL_TYPES,
+        max_connections=100,
         drop_pending_updates=False,
     )
     logger.info("وبهوک روی %s تنظیم شد", webhook_url)
