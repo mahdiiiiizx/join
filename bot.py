@@ -44,17 +44,18 @@
     );
 
 نکته‌ی مهم درباره‌ی آیتم از نوع «ربات»:
-دکمه‌ی ربات یک callback است، نه لینک مستقیم. وقتی کاربر روی آن می‌زند:
-  ۱) ربات همان لحظه یک ردیف در جدول bot_starts برای (ربات مقصد، کاربر) ثبت می‌کند
-     (یعنی کلیک = تایید عضویت در آن ربات)،
-  ۲) با answer_callback_query(url=...) پیوی ربات مقصد با لینک t.me/BOT?start=...
-     برای کاربر باز می‌شود و کاربر فقط Start را می‌زند.
-به همین دلیل نیازی به دیتابیس مشترک یا تغییر در ربات مقصد نیست.
+دکمه‌ی ربات یک دکمه‌ی لینک به آدرس خودِ همین ربات است (/go/...). وقتی کاربر می‌زند:
+  ۱) سرور همین ربات کلیک را می‌گیرد و یک ردیف در جدول bot_starts برای
+     (ربات مقصد، کاربر) ثبت می‌کند (یعنی کلیک = تایید عضویت)،
+  ۲) همان لحظه کاربر به t.me/BOT?start=... هدایت می‌شود و پیوی ربات مقصد باز می‌شود.
+نیازی به دیتابیس مشترک یا تغییر در ربات مقصد نیست.
 محدودیت: چون تلگرام راهی برای فهمیدن «Start واقعی» در ربات دیگر نمی‌دهد،
-تایید بر پایه‌ی کلیک است.
+تایید بر پایه‌ی کلیک است. برای کار کردن لینک‌ها WEBHOOK_SECRET را ثابت ست کنید.
 """
 
 import asyncio
+import hashlib
+import hmac
 import html
 import logging
 import os
@@ -339,13 +340,22 @@ async def build_full_warn_text(user: User, items: list, use_default: bool = Fals
     return intro
 
 
+def _go_signature(item_id: int, user_id: int) -> str:
+    msg = f"{item_id}:{user_id}".encode()
+    return hmac.new(WEBHOOK_SECRET.encode(), msg, hashlib.sha256).hexdigest()[:16]
+
+
+def make_go_url(item_id: int, user_id: int) -> str:
+    return f"{BASE_URL}/go/{item_id}/{user_id}/{_go_signature(item_id, user_id)}"
+
+
 def build_items_keyboard(items: list, user_id: int, check_text: str = "✅ بررسی عضویت") -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
         if it.get("kind") == "bot":
-            # کلیک = ثبت تایید عضویت + باز شدن پیوی ربات با لینک استارت
-            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", callback_data=f"botgo_{it['id']}_{user_id}", style="primary")])
+            # دکمه‌ی لینک به آدرس خودِ ربات؛ آنجا کلیک ثبت و تایید می‌شود و کاربر به پیوی ربات مقصد هدایت می‌شود
+            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=make_go_url(it["id"], user_id), style="primary")])
         else:
             rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
     rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}", style="success")])
@@ -689,8 +699,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "۱) یوزرنیم ربات: <code>@id_bot</code>\n"
             "۲) لینک ربات: <code>https://t.me/id_bot</code>\n"
             "۳) لینک دعوت با پارامتر استارت: <code>https://t.me/id_bot?start=ref123</code>\n\n"
-            "وقتی کاربر روی دکمه‌ی این ربات بزند، به پیوی آن ربات هدایت می‌شود "
-            "(دکمه‌ی Start با همان پارامتر آماده است) و همان لحظه عضویتش در این مورد تایید می‌شود. "
+            "وقتی کاربر روی دکمه‌ی این ربات بزند، ابتدا عضویتش تایید و ثبت می‌شود و بلافاصله "
+            "به پیوی آن ربات هدایت می‌شود (دکمه‌ی Start با همان پارامتر آماده است). "
             "نیازی به تغییر در ربات مقصد یا دیتابیس مشترک نیست.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_channels"),
@@ -1116,6 +1126,41 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL", "")).rstrip("/")
 
 
+async def _go_redirect(request: web.Request) -> web.Response:
+    """کلیک روی دکمه‌ی ربات: تایید عضویت کاربر در آن ربات + هدایت به پیوی ربات با لینک استارت."""
+    try:
+        item_id = int(request.match_info["item_id"])
+        user_id = int(request.match_info["user_id"])
+    except (KeyError, ValueError):
+        return web.Response(status=400, text="bad request")
+
+    signature = request.match_info.get("sig", "")
+    if not hmac.compare_digest(signature, _go_signature(item_id, user_id)):
+        return web.Response(status=403, text="forbidden")
+
+    item = await get_item(item_id)
+    if not item or item.get("kind") != "bot":
+        return web.Response(status=404, text="not found")
+
+    await record_bot_start(item["chat_id"], user_id)
+
+    target = item["invite_link"]
+    safe_target = html.escape(target, quote=True)
+    body = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        f'<meta http-equiv="refresh" content="0;url={safe_target}">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+        f'<body><a href="{safe_target}">Open</a>'
+        f'<script>location.replace({target!r});</script></body></html>'
+    )
+    return web.Response(
+        status=302,
+        headers={"Location": target, "Cache-Control": "no-store"},
+        text=body,
+        content_type="text/html",
+    )
+
+
 async def _health(_request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
@@ -1203,6 +1248,7 @@ def main() -> None:
     web_app["application"] = application
     web_app.router.add_get("/", _health)
     web_app.router.add_get("/healthz", _health)
+    web_app.router.add_get("/go/{item_id}/{user_id}/{sig}", _go_redirect)
     web_app.router.add_post(WEBHOOK_PATH, _telegram_webhook)
     web_app.on_startup.append(_on_startup)
     web_app.on_cleanup.append(_on_cleanup)
