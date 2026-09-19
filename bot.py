@@ -79,6 +79,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -387,8 +388,8 @@ def build_items_keyboard(items: list, user_id: int, check_text: str = "✅ بر�
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
-        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
-    rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}", style="success")])
+        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"])])
+    rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -506,7 +507,7 @@ async def _delete_message_after(bot, chat_id: int, message_id: int, delay: float
 
 
 _warn_locks: dict = {}    # user_id -> Lock (فقط یک هشدار هم‌زمان برای هر کاربر)
-_active_warn: dict = {}   # user_id -> (message_id هشدار فعال، زمان انقضای اطمینان)
+_active_warn: dict = {}   # user_id -> (message_id هشدار فعال، زمان انقضای اطمینان، chat_id گروه)
 
 
 def _get_warn_lock(user_id: int) -> asyncio.Lock:
@@ -616,13 +617,92 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         # با حذف پیام هشدار (بعد از تایمر) این وضعیت آزاد می‌شود و پیام بعدیِ کاربر هشدار جدید می‌گیرد
         expires_in = delay + 15.0 if delay > 0 else 3600.0
-        _active_warn[user.id] = (warn_msg.message_id, time.monotonic() + expires_in)
+        _active_warn[user.id] = (warn_msg.message_id, time.monotonic() + expires_in, chat.id)
 
     if delay > 0:
         task = asyncio.create_task(
             _delete_message_after(context.bot, chat.id, warn_msg.message_id, delay, user.id)
         )
         task.add_done_callback(_log_task_exception)
+
+
+async def _edit_warning_message(bot, chat_id: int, message_id: int, user: User, missing: list) -> None:
+    """پیام هشدار را ادیت می‌کند: اگر چیزی باقی نمانده متن تایید عضویت، وگرنه فقط موارد باقی‌مانده."""
+    for use_default in (False, True):
+        if missing:
+            text = await build_full_warn_text(user, missing, use_default=use_default)
+            markup = build_items_keyboard(missing, user.id)
+        else:
+            template = DEFAULT_JOINED_TEXT if use_default else await get_text("joined_text", DEFAULT_JOINED_TEXT)
+            text = render_template(template, user)
+            markup = None
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower() or "not found" in str(exc).lower():
+                return
+            logger.warning("ادیت خودکار پیام هشدار ناموفق (use_default=%s): %s", use_default, exc)
+        except (Forbidden, TimedOut, NetworkError) as exc:
+            logger.warning("ادیت خودکار پیام هشدار ناموفق: %s", exc)
+            return
+
+
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    تایید خودکار: وقتی کاربر در یکی از کانال‌ها/گروه‌های جوین اجباری عضو می‌شود، بدون زدن «بررسی عضویت»
+    پیام هشدارش ادیت می‌شود (دکمه‌ی همان مورد حذف می‌شود، و اگر همه کامل بود متن تایید عضویت می‌آید).
+    ربات باید در آن کانال/گروه ادمین باشد تا تلگرام رویداد chat_member را بفرستد.
+    """
+    cmu = update.chat_member
+    if cmu is None:
+        return
+
+    member = cmu.new_chat_member
+    user = member.user
+    if user.is_bot:
+        return
+
+    items = await list_items()
+    chat_key = str(cmu.chat.id)
+    if not any(it.get("kind") != "bot" and str(it["chat_id"]) == chat_key for it in items):
+        return
+
+    _membership_cache.pop(user.id, None)
+
+    joined = member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ) or (member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False))
+    if not joined:
+        return
+
+    async with _get_warn_lock(user.id):
+        real_items = [it for it in items if it.get("kind") != "bot"]
+        bot_items = [it for it in items if it.get("kind") == "bot"]
+
+        # کانال/گروه‌ها کامل شد → ورود به ربات‌ها هم خودکار تایید می‌شود (بررسی واقعی برای ربات ممکن نیست)
+        if not await get_missing_items(context.bot, user.id, real_items) and bot_items:
+            await asyncio.gather(*[record_bot_start(it["chat_id"], user.id) for it in bot_items])
+
+        missing = await get_missing_items(context.bot, user.id, items)
+        store_membership(user.id, missing)
+
+        active = _active_warn.get(user.id)
+        if active is None:
+            return
+        message_id, _expires, warn_chat_id = active
+        await _edit_warning_message(context.bot, warn_chat_id, message_id, user, missing)
+        if not missing:
+            _active_warn.pop(user.id, None)
 
 
 async def _guard_button_owner(query, owner_part: str) -> bool:
@@ -1314,6 +1394,7 @@ def main() -> None:
     application.add_error_handler(on_error)
 
     application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     application.add_handler(CallbackQueryHandler(on_check_membership, pattern=r"^check_membership(_\d+)?$"))
     application.add_handler(CallbackQueryHandler(owner_panel_router, pattern="^(menu_|ch_|txt_)"))
