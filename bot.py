@@ -44,21 +44,18 @@
     );
 
 نکته‌ی مهم درباره‌ی آیتم از نوع «ربات»:
-تلگرام هیچ API‌ای ندارد که به یک ربات بگوید «آیا کاربر X، ربات Y را استارت
-کرده؟» (بر خلاف کانال/گروه که get_chat_member کار می‌کند). پس تنها راه این
-است که خودِ ربات مقصد، هنگام دریافت /start یک رکورد در جدول bot_starts ثبت
-کند. اگر ربات‌های دیگر شما هم از همین ساختار Supabase استفاده می‌کنند،
-همین چند خط را به هندلر /start آن‌ها اضافه کنید:
-
-    supabase.table("bot_starts").upsert(
-        {"bot_username": "<username_without_at>", "user_id": update.effective_user.id}
-    ).execute()
-
-بدون این کار، آیتم‌های نوع «ربات» فقط دکمه‌شان نمایش داده می‌شود ولی وضعیت
-عضویت همیشه «نامعلوم/رد» خواهد بود.
+دکمه‌ی ربات یک callback است، نه لینک مستقیم. وقتی کاربر روی آن می‌زند:
+  ۱) ربات همان لحظه یک ردیف در جدول bot_starts برای (ربات مقصد، کاربر) ثبت می‌کند
+     (یعنی کلیک = تایید عضویت در آن ربات)،
+  ۲) با answer_callback_query(url=...) پیوی ربات مقصد با لینک t.me/BOT?start=...
+     برای کاربر باز می‌شود و کاربر فقط Start را می‌زند.
+به همین دلیل نیازی به دیتابیس مشترک یا تغییر در ربات مقصد نیست.
+محدودیت: چون تلگرام راهی برای فهمیدن «Start واقعی» در ربات دیگر نمی‌دهد،
+تایید بر پایه‌ی کلیک است.
 """
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -102,8 +99,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 # آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
 ADMIN_IDS = {601668306, 8977934490}
 
-DEFAULT_WARN_TEXT = "کاربر {mention}\nبرای ارسال پیام باید در موارد زیر عضو شوید:"
-DEFAULT_JOINED_TEXT = "کاربر {mention} در همه‌ی موارد عضو شد ✅"
+DEFAULT_WARN_TEXT = "<b>کاربر {mention}\nبرای ارسال پیام باید در موارد زیر عضو شوید:</b>"
+DEFAULT_JOINED_TEXT = "<b>کاربر {mention} در همه‌ی موارد عضو شد ✅</b>"
 
 KIND_LABEL = {"channel": "کانال", "group": "گروه", "bot": "ربات"}
 KIND_ICON = {"channel": "📢", "group": "👥", "bot": "🤖"}
@@ -275,6 +272,19 @@ async def has_started_bot(bot_username: str, user_id: int) -> bool:
     return await asyncio.to_thread(_safe_db, _run, False)
 
 
+async def count_bot_starts(bot_username: str) -> int:
+    def _run():
+        res = (
+            supabase.table("bot_starts")
+            .select("user_id", count="exact")
+            .eq("bot_username", bot_username.lower())
+            .execute()
+        )
+        return res.count or 0
+
+    return await asyncio.to_thread(_safe_db, _run, 0)
+
+
 async def record_bot_start(bot_username: str, user_id: int) -> None:
     def _run():
         supabase.table("bot_starts").upsert(
@@ -310,18 +320,18 @@ def render_template(template: str, user: User) -> str:
 
 
 def build_items_list_text(items: list) -> str:
-    """لیست خودکار کانال‌ها/گروه‌ها/ربات‌ها که همیشه زیر متن سفارشی چاپ می‌شود."""
+    """لیست خودکار موارد باقی‌مانده؛ داخل نقل قول (blockquote) چاپ می‌شود."""
     if not items:
         return ""
     lines = []
     for it in items:
         label = KIND_LABEL.get(it.get("kind", "channel"), "کانال")
-        lines.append(f"{label}: {it['title']}")
-    return "\n".join(lines)
+        lines.append(f"{label}: {html.escape(it['title'])}")
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
-async def build_full_warn_text(user: User, items: list) -> str:
-    intro_template = await get_text("warn_text", DEFAULT_WARN_TEXT)
+async def build_full_warn_text(user: User, items: list, use_default: bool = False) -> str:
+    intro_template = DEFAULT_WARN_TEXT if use_default else await get_text("warn_text", DEFAULT_WARN_TEXT)
     intro = render_template(intro_template, user)
     items_text = build_items_list_text(items)
     if items_text:
@@ -329,12 +339,16 @@ async def build_full_warn_text(user: User, items: list) -> str:
     return intro
 
 
-def build_items_keyboard(items: list, check_text: str = "✅ بررسی عضویت") -> InlineKeyboardMarkup:
+def build_items_keyboard(items: list, user_id: int, check_text: str = "✅ بررسی عضویت") -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = KIND_ICON.get(it.get("kind", "channel"), "📢")
-        rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
-    rows.append([InlineKeyboardButton(check_text, callback_data="check_membership", style="success")])
+        if it.get("kind") == "bot":
+            # کلیک = ثبت تایید عضویت + باز شدن پیوی ربات با لینک استارت
+            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", callback_data=f"botgo_{it['id']}_{user_id}", style="primary")])
+        else:
+            rows.append([InlineKeyboardButton(text=f"{icon} {it['title']}", url=it["invite_link"], style="primary")])
+    rows.append([InlineKeyboardButton(check_text, callback_data=f"check_membership_{user_id}", style="success")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -355,6 +369,16 @@ async def _check_single_item(bot, item: dict, user_id: int) -> bool:
     except (TimedOut, NetworkError) as exc:
         logger.warning("تایم‌اوت شبکه هنگام بررسی %s: %s", item.get("title"), exc)
         return False
+
+
+async def get_missing_items(bot, user_id: int, items: Optional[list] = None) -> list:
+    """آیتم‌هایی که کاربر هنوز در آن‌ها عضو نیست (بررسی موازی)."""
+    if items is None:
+        items = await list_items()
+    if not items:
+        return []
+    results = await asyncio.gather(*[_check_single_item(bot, it, user_id) for it in items])
+    return [it for it, ok in zip(items, results) if not ok]
 
 
 async def is_member_of_all_items(bot, user_id: int) -> bool:
@@ -412,8 +436,8 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not items:
         return  # هیچ آیتمی تنظیم نشده، محدودیتی اعمال نمی‌شود
 
-    ok = await is_member_of_all_items(context.bot, user.id)
-    if ok:
+    missing = await get_missing_items(context.bot, user.id, items)
+    if not missing:
         return
 
     try:
@@ -421,19 +445,25 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except (BadRequest, Forbidden) as exc:
         logger.warning("عدم امکان حذف پیام: %s", exc)
 
-    text = await build_full_warn_text(user, items)
-    keyboard = build_items_keyboard(items)
-
-    try:
-        warn_msg = await context.bot.send_message(
-            chat_id=chat.id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-    except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
-        logger.error("ارسال پیام هشدار ناموفق بود: %s", exc)
+    keyboard = build_items_keyboard(missing, user.id)
+    warn_msg = None
+    for use_default in (False, True):
+        text = await build_full_warn_text(user, missing, use_default=use_default)
+        try:
+            warn_msg = await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            break
+        except BadRequest as exc:
+            logger.error("ارسال پیام هشدار ناموفق بود (use_default=%s): %s", use_default, exc)
+        except (Forbidden, TimedOut, NetworkError) as exc:
+            logger.error("ارسال پیام هشدار ناموفق بود: %s", exc)
+            return
+    if warn_msg is None:
         return
 
     delay = await get_warn_delete_seconds()
@@ -444,30 +474,92 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         task.add_done_callback(_log_task_exception)
 
 
+async def _guard_button_owner(query, owner_part: str) -> bool:
+    """دکمه‌های پیام هشدار فقط برای کاربرِ هدفِ پیام فعال هستند. دکمه‌های قدیمی (بدون آیدی) رد نمی‌شوند."""
+    if owner_part.isdigit() and int(owner_part) != query.from_user.id:
+        await query.answer("این دکمه برای شما نیست، پیام خودتان را بفرستید.", show_alert=True)
+        return False
+    return True
+
+
 async def on_check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = query.from_user
 
+    if not await _guard_button_owner(query, query.data.rpartition("_")[2]):
+        return
+
     try:
-        ok = await is_member_of_all_items(context.bot, user.id)
+        missing = await get_missing_items(context.bot, user.id)
     except Exception as exc:  # noqa: BLE001
         logger.error("خطا در بررسی عضویت: %s", exc)
         await query.answer("خطای موقت، دوباره تلاش کنید.", show_alert=True)
         return
 
-    if not ok:
+    if missing:
+        # فقط موارد باقی‌مانده نمایش داده می‌شود؛ دکمه‌ی مواردی که عضو شده حذف می‌شود
+        for use_default in (False, True):
+            text = await build_full_warn_text(user, missing, use_default=use_default)
+            try:
+                await query.edit_message_text(
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_items_keyboard(missing, user.id),
+                    disable_web_page_preview=True,
+                )
+                await query.answer("هنوز در موارد باقی‌مانده عضو نشده‌اید ❌")
+                return
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    await query.answer("هنوز در موارد باقی‌مانده عضو نشده‌اید ❌", show_alert=True)
+                    return
+                logger.warning("ادیت پیام هشدار ناموفق (use_default=%s): %s", use_default, exc)
         await query.answer("هنوز در همه‌ی موارد عضو نشده‌اید ❌", show_alert=True)
         return
 
-    joined_template = await get_text("joined_text", DEFAULT_JOINED_TEXT)
-    text = render_template(joined_template, user)
-
-    try:
-        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML)
-    except BadRequest as exc:
-        logger.info("ادیت پیام ناموفق: %s", exc)
+    for use_default in (False, True):
+        joined_template = DEFAULT_JOINED_TEXT if use_default else await get_text("joined_text", DEFAULT_JOINED_TEXT)
+        text = render_template(joined_template, user)
+        try:
+            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML)
+            break
+        except BadRequest as exc:
+            logger.info("ادیت پیام تایید ناموفق (use_default=%s): %s", use_default, exc)
 
     await query.answer("عضویت شما تایید شد ✅")
+
+
+async def on_bot_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """کلیک روی دکمه‌ی ربات = تایید عضویت در آن ربات + باز شدن پیوی ربات با لینک استارت."""
+    query = update.callback_query
+    user = query.from_user
+
+    parts = query.data.split("_")
+    try:
+        item_id = int(parts[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    owner_part = parts[2] if len(parts) > 2 else ""
+    if not await _guard_button_owner(query, owner_part):
+        return
+
+    item = await get_item(item_id)
+    if not item or item.get("kind") != "bot":
+        await query.answer("این مورد دیگر وجود ندارد.", show_alert=True)
+        return
+
+    await record_bot_start(item["chat_id"], user.id)
+
+    try:
+        await query.answer(url=item["invite_link"])
+    except (BadRequest, TelegramError) as exc:
+        logger.warning("باز کردن لینک ربات ناموفق بود (%s): %s", item.get("chat_id"), exc)
+        try:
+            await query.answer("لینک ربات را از پیام باز کنید.", show_alert=True)
+        except TelegramError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -593,10 +685,13 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "ch_add_bot":
         PENDING_BOT_ADD.add(user_id)
         await query.edit_message_text(
-            "یوزرنیم ربات مورد نظر را ارسال کنید (مثلاً <code>@id_bot</code>).\n\n"
-            "⚠️ توجه: چون تلگرام راهی برای پرسیدن از ربات دیگر «آیا کاربر مرا استارت کرده؟» ندارد، "
-            "باید در ربات مقصد هم یک خط کد برای ثبت استارت در جدول bot_starts اضافه کنید "
-            "(در ابتدای فایل bot.py توضیح داده شده).",
+            "یکی از این‌ها را ارسال کنید:\n\n"
+            "۱) یوزرنیم ربات: <code>@id_bot</code>\n"
+            "۲) لینک ربات: <code>https://t.me/id_bot</code>\n"
+            "۳) لینک دعوت با پارامتر استارت: <code>https://t.me/id_bot?start=ref123</code>\n\n"
+            "وقتی کاربر روی دکمه‌ی این ربات بزند، به پیوی آن ربات هدایت می‌شود "
+            "(دکمه‌ی Start با همان پارامتر آماده است) و همان لحظه عضویتش در این مورد تایید می‌شود. "
+            "نیازی به تغییر در ربات مقصد یا دیتابیس مشترک نیست.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_channels"),
         )
@@ -637,7 +732,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.answer("این آیتم دیگر وجود ندارد.", show_alert=True)
             return
         if item.get("kind") == "bot":
-            await query.answer("برای آیتم‌های نوع «ربات» تعداد در دسترس نیست.", show_alert=True)
+            clicks = await count_bot_starts(item["chat_id"])
+            await query.answer(f"تعداد کاربرانی که روی دکمه‌ی این ربات زده‌اند: {clicks}", show_alert=True)
             return
         try:
             count = await context.bot.get_chat_member_count(item["chat_id"])
@@ -662,9 +758,10 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         PENDING_TEXT_EDIT[user_id] = "warn_text"
         current = await get_text("warn_text", DEFAULT_WARN_TEXT)
         await query.edit_message_text(
-            "متن فعلی هشدار عضویت (لیست کانال/گروه/ربات‌ها خودکار زیرش اضافه می‌شود):\n\n"
-            f"<code>{current}</code>\n\n"
-            "متن جدید را ارسال کنید. متغیرهای قابل استفاده: <code>{mention}</code> یا <code>منشن_کاربر</code>",
+            "متن فعلی هشدار عضویت (لیست موارد باقی‌مانده خودکار زیرش، داخل نقل قول، اضافه می‌شود):\n\n"
+            f"<code>{html.escape(current)}</code>\n\n"
+            "متن جدید را با همان قالب‌بندی دلخواه (بولد، نقل قول، کج، زیرخط، اسپویلر و...) ارسال کنید؛ "
+            "دقیقاً همان‌طور در گروه ارسال می‌شود. متغیرها: <code>{mention}</code> یا <code>منشن_کاربر</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_texts"),
         )
@@ -674,8 +771,9 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         current = await get_text("joined_text", DEFAULT_JOINED_TEXT)
         await query.edit_message_text(
             "متن فعلی تایید عضویت:\n\n"
-            f"<code>{current}</code>\n\n"
-            "متن جدید را ارسال کنید. متغیرهای قابل استفاده: <code>{mention}</code> یا <code>منشن_کاربر</code>",
+            f"<code>{html.escape(current)}</code>\n\n"
+            "متن جدید را با همان قالب‌بندی دلخواه ارسال کنید؛ دقیقاً همان‌طور در گروه ارسال می‌شود. "
+            "متغیرها: <code>{mention}</code> یا <code>منشن_کاربر</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu_texts"),
         )
@@ -904,29 +1002,42 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     # حالت: افزودن ربات
     if user_id in PENDING_BOT_ADD:
         PENDING_BOT_ADD.discard(user_id)
-        raw = (message.text or "").strip().lstrip("@")
-        if not raw:
-            await message.reply_text("یوزرنیم نامعتبر است.")
-            return
-        try:
-            bot_chat = await context.bot.get_chat(f"@{raw}")
-        except (BadRequest, Forbidden) as exc:
-            await message.reply_text(f"ربات پیدا نشد: {exc}")
-            return
+        raw = (message.text or "").strip()
+        m = re.match(
+            r"^(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})/?(?:\?(.*))?$",
+            raw,
+            re.IGNORECASE,
+        )
+        if m:
+            username = m.group(1)
+            query_string = m.group(2) or ""
+            deep_link = f"https://t.me/{username}" + (f"?{query_string}" if "start=" in query_string else "?start=verify_join")
+        else:
+            username = raw.lstrip("@")
+            if not re.match(r"^[A-Za-z0-9_]{5,32}$", username):
+                await message.reply_text("یوزرنیم یا لینک نامعتبر است.")
+                return
+            deep_link = f"https://t.me/{username}?start=verify_join"
 
-        title = bot_chat.first_name or bot_chat.title or raw
-        deep_link = f"https://t.me/{raw}?start=verify_join"
-        err = await add_item("bot", raw, title, deep_link)
+        title = username
+        try:
+            bot_chat = await context.bot.get_chat(f"@{username}")
+            title = bot_chat.first_name or bot_chat.title or username
+        except (BadRequest, Forbidden) as exc:
+            logger.info("گرفتن اطلاعات ربات %s ممکن نبود، از یوزرنیم به‌عنوان عنوان استفاده شد: %s", username, exc)
+
+        err = await add_item("bot", username, title, deep_link)
         if err:
             await message.reply_text(
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
             )
             return
         await message.reply_text(
-            f"ربات «{title}» اضافه شد ✅\n\n"
-            "یادت نره: در هندلر /start همین ربات مقصد، یک ردیف در جدول bot_starts ثبت کن "
-            "تا تشخیص عضویت درست کار کند (توضیح کامل بالای فایل bot.py هست).",
+            f"ربات «{title}» اضافه شد ✅\n"
+            f"لینک استارت: {deep_link}\n\n"
+            "کلیک کاربر روی دکمه‌ی این ربات، عضویتش را تایید می‌کند.",
             reply_markup=CHANNELS_MENU,
+            disable_web_page_preview=True,
         )
         return
 
@@ -970,7 +1081,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
     # حالت: ویرایش متن‌ها
     if user_id in PENDING_TEXT_EDIT:
         key = PENDING_TEXT_EDIT.pop(user_id)
-        new_text = message.text or ""
+        new_text = message.text_html or ""  # قالب‌بندی (بولد، نقل قول، ...) به‌صورت HTML ذخیره می‌شود
         err = await set_text(key, new_text)
         if err:
             await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
@@ -1077,7 +1188,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start_cmd))
 
-    application.add_handler(CallbackQueryHandler(on_check_membership, pattern="^check_membership$"))
+    application.add_handler(CallbackQueryHandler(on_check_membership, pattern=r"^check_membership(_\d+)?$"))
+    application.add_handler(CallbackQueryHandler(on_bot_link_click, pattern=r"^botgo_\d+(_\d+)?$"))
     application.add_handler(CallbackQueryHandler(owner_panel_router, pattern="^(menu_|ch_|txt_)"))
 
     application.add_handler(
