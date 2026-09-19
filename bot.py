@@ -26,11 +26,13 @@
         chat_id text not null unique,           -- آیدی عددی کانال/گروه یا یوزرنیم ربات (بدون @)
         title text not null,
         invite_link text not null,
-        expires_at timestamptz                  -- زمان پایان جوین اجباریِ این آیتم (خالی = بدون محدودیت)
+        expires_at timestamptz,                 -- زمان پایان جوین اجباریِ این آیتم (خالی = بدون محدودیت)
+        start_members bigint                    -- تعداد اعضا در لحظه‌ی ثبت آیتم (مبنای شمارش ورودی‌ها)
     );
 
     -- اگر جدول channels را قبلاً ساخته‌اید، فقط این را اجرا کنید:
     alter table channels add column if not exists expires_at timestamptz;
+    alter table channels add column if not exists start_members bigint;
 
     create table if not exists texts (
         key text primary key,
@@ -221,14 +223,16 @@ async def set_warn_delete_seconds(seconds: float) -> Optional[str]:
     return await set_setting("warn_delete_seconds", str(seconds))
 
 
-async def add_item(kind: str, chat_id: str, title: str, invite_link: str) -> Optional[str]:
+async def add_item(kind: str, chat_id: str, title: str, invite_link: str, start_members: Optional[int] = None) -> Optional[str]:
     """در صورت موفقیت None برمی‌گرداند، در صورت خطا متن خطا را برمی‌گرداند."""
 
     def _run():
-        supabase.table("channels").upsert(
-            {"kind": kind, "chat_id": chat_id, "title": title, "invite_link": invite_link},
-            on_conflict="chat_id",
-        ).execute()
+        payload = {"kind": kind, "chat_id": chat_id, "title": title, "invite_link": invite_link}
+        existing = supabase.table("channels").select("id,start_members").eq("chat_id", chat_id).execute().data
+        # مبنای شمارش فقط یک بار ثبت می‌شود؛ ثبت مجدد همان آیتم آن را ریست نمی‌کند
+        if start_members is not None and not (existing and existing[0].get("start_members") is not None):
+            payload["start_members"] = start_members
+        supabase.table("channels").upsert(payload, on_conflict="chat_id").execute()
 
     try:
         await asyncio.to_thread(_run)
@@ -926,23 +930,75 @@ def back_kb(callback_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback_data)]])
 
 
-def build_list_keyboard(items: list) -> InlineKeyboardMarkup:
+MEMBER_COUNT_TTL_SECONDS = 60.0
+_member_count_cache: dict = {}  # chat_id -> (زمان، تعداد)
+
+
+def format_count(count: Optional[int]) -> str:
+    return f"{count:,}" if isinstance(count, int) else "—"
+
+
+async def _save_start_members(item_id: int, value: int) -> None:
+    def _run():
+        supabase.table("channels").update({"start_members": value}).eq("id", item_id).execute()
+
+    await asyncio.to_thread(_safe_db, _run, None)
+    _cache_clear()
+
+
+async def fetch_member_count(bot, item: dict, force: bool = False) -> Optional[int]:
+    """تعداد کاربرانی که از لحظه‌ی ثبت آیتم تا الان وارد شده‌اند = تعداد فعلی − تعداد اولیه. خطا = None."""
+    key = str(item["chat_id"])
+    now = time.monotonic()
+    hit = _member_count_cache.get(key)
+    if hit and not force and now - hit[0] < MEMBER_COUNT_TTL_SECONDS:
+        current = hit[1]
+    else:
+        try:
+            if item.get("kind") == "bot":
+                current = await count_bot_starts(item["chat_id"])
+            else:
+                current = await bot.get_chat_member_count(item["chat_id"])
+        except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+            logger.warning("خطا در دریافت تعداد اعضای %s: %s", item.get("title"), exc)
+            if not hit:
+                return None
+            current = hit[1]
+        else:
+            _member_count_cache[key] = (now, current)
+
+    baseline = item.get("start_members")
+    if baseline is None:
+        # آیتم‌های قدیمی که مبنا ندارند: از همین لحظه شروع به شمارش می‌کنند
+        item["start_members"] = current
+        await _save_start_members(item["id"], current)
+        return 0
+    return max(0, current - baseline)
+
+
+async def fetch_member_counts(bot, items: list) -> dict:
+    counts = await asyncio.gather(*(fetch_member_count(bot, it) for it in items))
+    return {it["id"]: c for it, c in zip(items, counts)}
+
+
+def build_list_keyboard(items: list, counts: Optional[dict] = None) -> InlineKeyboardMarkup:
     rows = []
     for it in items:
         icon = "⛔️" if item_is_expired(it) else KIND_ICON.get(it.get("kind", "channel"), "📢")
-        rows.append([InlineKeyboardButton(f"{icon} {it['title']}", callback_data=f"ch_view_{it['id']}", style="primary")])
+        suffix = f"  •  👥 {format_count(counts.get(it['id']))}" if counts is not None else ""
+        rows.append([InlineKeyboardButton(f"{icon} {it['title']}{suffix}", callback_data=f"ch_view_{it['id']}", style="primary")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_channels")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_item_manage_keyboard(item: dict, member_count_label: str = "👥 کاربران عضو شده") -> InlineKeyboardMarkup:
+def build_item_manage_keyboard(item: dict, count: Optional[int] = None) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("⚡ تنظیم هم اکنون", callback_data=f"ch_now_{item['id']}", style="success"),
             InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item['id']}", style="primary"),
         ],
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
-        [InlineKeyboardButton(member_count_label, callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton(f"👥 {format_count(count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
     ]
@@ -1036,7 +1092,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not items:
             await query.edit_message_text("هیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
         else:
-            await query.edit_message_text("یکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items))
+            counts = await fetch_member_counts(context.bot, items)
+            await query.edit_message_text("یکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items, counts))
 
     elif data.startswith("ch_view_"):
         item_id = int(data.split("_")[-1])
@@ -1051,7 +1108,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"لینک: {item['invite_link']}\n"
                 f"وضعیت: {describe_item_schedule(item)}"
             )
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item))
+            count = await fetch_member_count(context.bot, item)
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item, count))
 
     elif data.startswith("ch_editlink_"):
         item_id = int(data.split("_")[-1])
@@ -1065,17 +1123,14 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         item_id = int(data.split("_")[-1])
         item = await get_item(item_id)
         if not item:
-            await query.answer("این آیتم دیگر وجود ندارد.", show_alert=True)
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
             return
-        if item.get("kind") == "bot":
-            clicks = await count_bot_starts(item["chat_id"])
-            await query.answer(f"تعداد کاربران تاییدشده برای این ربات: {clicks}", show_alert=True)
-            return
+        count = await fetch_member_count(context.bot, item, force=True)
         try:
-            count = await context.bot.get_chat_member_count(item["chat_id"])
-            await query.answer(f"تعداد اعضا: {count}", show_alert=True)
-        except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
-            await query.answer(f"خطا در دریافت تعداد اعضا: {exc}", show_alert=True)
+            await query.edit_message_reply_markup(reply_markup=build_item_manage_keyboard(item, count))
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
 
     elif data.startswith("ch_now_"):
         item_id = int(data.split("_")[-1])
@@ -1114,7 +1169,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         items = await list_all_items()
         msg = "حذف شد ✅" if removed else "حذف نشد، دوباره تلاش کنید."
         if items:
-            await query.edit_message_text(f"{msg}\n\nیکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items))
+            counts = await fetch_member_counts(context.bot, items)
+            await query.edit_message_text(f"{msg}\n\nیکی از موارد زیر را برای مدیریت انتخاب کنید:", reply_markup=build_list_keyboard(items, counts))
         else:
             await query.edit_message_text(f"{msg}\n\nهیچ آیتمی ثبت نشده است.", reply_markup=back_kb("menu_channels"))
 
@@ -1291,7 +1347,12 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     return
             kind = "channel" if chat_full.type == Chat.CHANNEL else "group"
-            err = await add_item(kind, str(chat_full.id), chat_full.title, invite_link)
+            try:
+                baseline = await context.bot.get_chat_member_count(chat_full.id)
+            except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+                logger.warning("گرفتن تعداد اولیه‌ی اعضا ممکن نبود: %s", exc)
+                baseline = None
+            err = await add_item(kind, str(chat_full.id), chat_full.title, invite_link, baseline)
             if err:
                 await message.reply_text(
                     f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>\n\n"
@@ -1401,7 +1462,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         except (BadRequest, Forbidden) as exc:
             logger.info("گرفتن اطلاعات ربات %s ممکن نبود، از یوزرنیم به‌عنوان عنوان استفاده شد: %s", username, exc)
 
-        err = await add_item("bot", username, title, deep_link)
+        err = await add_item("bot", username, title, deep_link, await count_bot_starts(username))
         if err:
             await message.reply_text(
                 f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
@@ -1432,10 +1493,11 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"❌ ذخیره نشد:\n{err}")
             return
         item = await get_item(item_id)
+        count = await fetch_member_count(context.bot, item) if item else None
         await message.reply_text(
             f"زمان تنظیم شد ✅ «{item['title'] if item else ''}» به مدت {format_duration(delta)} فعال است "
             "و بعد از آن خودکار از جوین اجباری کنار می‌رود.",
-            reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU,
+            reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU,
         )
         return
 
@@ -1451,7 +1513,8 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML)
             return
         item = await get_item(item_id)
-        await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item) if item else CHANNELS_MENU)
+        count = await fetch_member_count(context.bot, item) if item else None
+        await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU)
         return
 
     # حالت: تنظیم زمان حذف خودکار پیام هشدار
