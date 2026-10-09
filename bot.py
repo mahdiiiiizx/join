@@ -399,7 +399,8 @@ def item_member_limit(item: dict) -> int:
 def format_quota(item: dict, joined: Optional[int]) -> str:
     limit = item_member_limit(item)
     if limit <= 0:
-        return "نامحدود"
+        # نامحدود: تعداد ورودی‌ها همچنان نمایش داده می‌شود
+        return f"{format_count(joined)} / نامحدود"
     return f"{format_count(joined)} / {limit:,}"
 
 
@@ -1275,7 +1276,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"وضعیت: {describe_item_schedule(item)}"
             )
             count = await fetch_member_count(context.bot, item)
-            text += f"\nتعرفه‌ی ممبر: {format_quota(item, count)}"
+            text += f"\nتعداد ورودی‌ها: {format_quota(item, count)}"
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item, count))
 
     elif data.startswith("ch_editlink_"):
