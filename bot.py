@@ -27,12 +27,16 @@
         title text not null,
         invite_link text not null,
         expires_at timestamptz,                 -- زمان پایان جوین اجباریِ این آیتم (خالی = بدون محدودیت)
-        start_members bigint                    -- تعداد اعضا در لحظه‌ی ثبت آیتم (مبنای شمارش ورودی‌ها)
+        start_members bigint,                   -- تعداد اعضا در لحظه‌ی ثبت آیتم (مبنای شمارش ورودی‌ها)
+        member_limit bigint,                    -- تعرفه‌ی ممبر: تعداد ورودی مورد نیاز (خالی/0 = نامحدود)
+        quota_done boolean not null default false  -- true = تعرفه کامل شد و آیتم از جوین اجباری کنار رفته
     );
 
     -- اگر جدول channels را قبلاً ساخته‌اید، فقط این را اجرا کنید:
     alter table channels add column if not exists expires_at timestamptz;
     alter table channels add column if not exists start_members bigint;
+    alter table channels add column if not exists member_limit bigint;
+    alter table channels add column if not exists quota_done boolean not null default false;
 
     create table if not exists texts (
         key text primary key,
@@ -289,6 +293,8 @@ def _parse_ts(value) -> Optional[datetime]:
 
 
 def item_is_expired(item: dict) -> bool:
+    if item.get("quota_done"):
+        return True  # تعرفه‌ی ممبر کامل شده
     expires_at = _parse_ts(item.get("expires_at"))
     return expires_at is not None and expires_at <= datetime.now(timezone.utc)
 
@@ -309,6 +315,8 @@ def format_duration(delta: timedelta) -> str:
 
 
 def describe_item_schedule(item: dict) -> str:
+    if item.get("quota_done"):
+        return "⛔️ تعرفه‌ی ممبر کامل شد (دیگر جوین اجباری نیست)"
     expires_at = _parse_ts(item.get("expires_at"))
     if expires_at is None:
         return "فعال، بدون محدودیت زمانی"
@@ -318,8 +326,10 @@ def describe_item_schedule(item: dict) -> str:
 
 
 async def list_items() -> list:
-    """آیتم‌های فعالِ جوین اجباری (آیتم‌های منقضی‌شده حذف می‌شوند)."""
-    return [it for it in await _fetch_items() if not item_is_expired(it)]
+    """آیتم‌های فعالِ جوین اجباری (آیتم‌های منقضی‌شده یا تکمیل‌شده از نظر تعرفه حذف می‌شوند)."""
+    items = await _fetch_items()
+    await _enforce_quotas(items)
+    return [it for it in items if not item_is_expired(it)]
 
 
 async def list_all_items() -> list:
@@ -363,6 +373,97 @@ async def set_item_expiry(item_id: int, expires_at: Optional[datetime]) -> Optio
         if "expires_at" in str(exc):
             return EXPIRES_AT_MISSING_HINT
         return str(exc)
+
+
+MEMBER_LIMIT_MISSING_HINT = (
+    "ستون‌های تعرفه‌ی ممبر در جدول channels وجود ندارند. این کوئری‌ها را در Supabase اجرا کنید:\n"
+    "alter table channels add column if not exists member_limit bigint;\n"
+    "alter table channels add column if not exists quota_done boolean not null default false;"
+)
+MAX_MEMBER_LIMIT = 100_000_000
+QUOTA_CHECK_INTERVAL_SECONDS = 3.0   # حداقل فاصله‌ی بین دو دور بررسی تعرفه‌ها (برای جلوگیری از فشار روی API تلگرام)
+
+_quota_bot = None                    # در شروع برنامه مقدار می‌گیرد (برای شمارش اعضا از داخل list_items)
+_quota_lock = asyncio.Lock()
+_quota_last_check = 0.0
+
+
+def item_member_limit(item: dict) -> int:
+    """سقف تعداد ممبر آیتم؛ 0 یعنی نامحدود."""
+    try:
+        return max(int(item.get("member_limit") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def format_quota(item: dict, joined: Optional[int]) -> str:
+    limit = item_member_limit(item)
+    if limit <= 0:
+        return "نامحدود"
+    return f"{format_count(joined)} / {limit:,}"
+
+
+async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> Optional[str]:
+    """
+    ثبت تعرفه‌ی ممبر. limit=0 یعنی نامحدود.
+    با هر ثبت، شمارش از همین لحظه شروع می‌شود (baseline = تعداد فعلی اعضا) و وضعیت «تکمیل‌شده» ریست می‌شود.
+    در صورت خطا متن خطا را برمی‌گرداند.
+    """
+    payload: dict = {"member_limit": limit, "quota_done": False}
+    if limit > 0 and baseline is not None:
+        payload["start_members"] = baseline
+
+    def _run():
+        supabase.table("channels").update(payload).eq("id", item_id).execute()
+
+    try:
+        await asyncio.to_thread(_run)
+        _cache_clear()
+        _member_count_cache.clear()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام ثبت تعرفه‌ی ممبر: %s", exc)
+        if "member_limit" in str(exc) or "quota_done" in str(exc):
+            return MEMBER_LIMIT_MISSING_HINT
+        return str(exc)
+
+
+async def _mark_quota_done(item: dict) -> None:
+    item["quota_done"] = True  # روی همان دیکشنری کش‌شده، تا بلافاصله اعمال شود
+
+    def _run():
+        supabase.table("channels").update({"quota_done": True}).eq("id", item["id"]).execute()
+
+    await asyncio.to_thread(_safe_db, _run, None)
+    _cache_clear()
+    logger.info("تعرفه‌ی ممبر «%s» کامل شد و از جوین اجباری کنار رفت.", item.get("title"))
+
+
+async def _enforce_quotas(items: list) -> None:
+    """آیتم‌هایی که تعداد ورودی‌هایشان به سقف رسیده را برای همیشه از جوین اجباری کنار می‌گذارد."""
+    global _quota_last_check
+    if _quota_bot is None:
+        return
+    pending = [
+        it for it in items
+        if item_member_limit(it) > 0 and not it.get("quota_done") and not item_is_expired(it)
+    ]
+    if not pending:
+        return
+    if time.monotonic() - _quota_last_check < QUOTA_CHECK_INTERVAL_SECONDS:
+        return
+    async with _quota_lock:
+        if time.monotonic() - _quota_last_check < QUOTA_CHECK_INTERVAL_SECONDS:
+            return
+        _quota_last_check = time.monotonic()
+        counts = await asyncio.gather(
+            *(fetch_member_count(_quota_bot, it, force=True) for it in pending), return_exceptions=True
+        )
+        for it, joined in zip(pending, counts):
+            if isinstance(joined, Exception) or joined is None:
+                continue
+            if joined >= item_member_limit(it):
+                await _mark_quota_done(it)
 
 
 _PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
@@ -593,6 +694,7 @@ PENDING_ITEM_ADD: set = set()
 PENDING_BOT_ADD: set = set()
 PENDING_LINK_EDIT: dict = {}
 PENDING_ITEM_TIME: dict = {}   # user_id -> item_id (منتظر مدت زمان)
+PENDING_ITEM_QUOTA: dict = {}  # user_id -> (item_id، آیا بلافاصله بعد از افزودن است؟) منتظر تعداد ممبر
 PENDING_GROUP_SET: set = set()
 PENDING_DELETE_TIMER_SET: set = set()
 
@@ -826,10 +928,14 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     if user.is_bot:
         return
 
-    items = await list_items()
+    global _quota_last_check
     chat_key = str(cmu.chat.id)
-    if not any(it.get("kind") != "bot" and str(it["chat_id"]) == chat_key for it in items):
+    # آیتم ممکن است با همین ورود به سقف تعرفه برسد و از list_items بیرون برود؛ پس اول روی همه‌ی آیتم‌ها چک می‌کنیم
+    if not any(it.get("kind") != "bot" and str(it["chat_id"]) == chat_key for it in await list_all_items()):
         return
+
+    _quota_last_check = 0.0  # با هر ورود جدید، بررسی تعرفه بلافاصله انجام شود
+    items = await list_items()
 
     _membership_cache.pop(user.id, None)
 
@@ -1024,11 +1130,11 @@ async def fetch_member_counts(bot, items: list, force: bool = False) -> dict:
 
 
 def build_list_text(items: list, counts: dict, header: str = "یکی از موارد زیر را برای مدیریت انتخاب کنید:") -> str:
-    """متن لیست آیتم‌ها؛ هر خط دقیقاً با همان قالب دکمه‌ها: آیکن عنوان  •  👥 تعداد ورودی از زمان شروع."""
+    """متن لیست آیتم‌ها؛ هر خط دقیقاً با همان قالب دکمه‌ها: آیکن عنوان  •  👥 ورودی (/ تعرفه)."""
     lines = []
     for it in items:
         icon = "⛔️" if item_is_expired(it) else KIND_ICON.get(it.get("kind", "channel"), "📢")
-        lines.append(f"{icon} {html.escape(it['title'])}  •  👥 {format_count(counts.get(it['id']))}")
+        lines.append(f"{icon} {html.escape(it['title'])}  •  👥 {format_quota(it, counts.get(it['id']))}")
     body = "\n".join(lines)
     return f"{header}\n\n{body}" if body else header
 
@@ -1037,7 +1143,7 @@ def build_list_keyboard(items: list, counts: Optional[dict] = None) -> InlineKey
     rows = []
     for it in items:
         icon = "⛔️" if item_is_expired(it) else KIND_ICON.get(it.get("kind", "channel"), "📢")
-        suffix = f"  •  👥 {format_count(counts.get(it['id']))}" if counts is not None else ""
+        suffix = f"  •  👥 {format_quota(it, counts.get(it['id']))}" if counts is not None else ""
         rows.append([InlineKeyboardButton(f"{icon} {it['title']}{suffix}", callback_data=f"ch_view_{it['id']}", style="primary")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_channels")])
     return InlineKeyboardMarkup(rows)
@@ -1050,7 +1156,8 @@ def build_item_manage_keyboard(item: dict, count: Optional[int] = None) -> Inlin
             InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item['id']}", style="primary"),
         ],
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
-        [InlineKeyboardButton(f"👥 {format_count(count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton(f"👥 {format_quota(item, count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton("🎯 تعرفه‌ی ممبر", callback_data=f"ch_quota_{item['id']}", style="primary")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
     ]
@@ -1071,6 +1178,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(user.id):
         await update.message.reply_text("این ربات فقط توسط ادمین‌ها قابل مدیریت است.")
         return
+    PENDING_ITEM_QUOTA.pop(user.id, None)
     await update.message.reply_text(
         "به پنل مدیریت ربات جوین اجباری خوش آمدید 👋",
         reply_markup=MAIN_MENU,
@@ -1091,6 +1199,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not data.startswith("ch_time_"):
         PENDING_ITEM_TIME.pop(user_id, None)
+    if not data.startswith("ch_quota_"):
+        PENDING_ITEM_QUOTA.pop(user_id, None)
 
     if data == "menu_main":
         await query.edit_message_text("پنل مدیریت:", reply_markup=MAIN_MENU)
@@ -1165,6 +1275,7 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"وضعیت: {describe_item_schedule(item)}"
             )
             count = await fetch_member_count(context.bot, item)
+            text += f"\nتعرفه‌ی ممبر: {format_quota(item, count)}"
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_item_manage_keyboard(item, count))
 
     elif data.startswith("ch_editlink_"):
@@ -1188,6 +1299,19 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if "not modified" not in str(exc).lower():
                 raise
 
+    elif data.startswith("ch_quota_"):
+        item_id = int(data.split("_")[-1])
+        item = await get_item(item_id)
+        if not item:
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
+            return
+        PENDING_ITEM_QUOTA[user_id] = (item_id, False)
+        await query.edit_message_text(
+            QUOTA_PROMPT.format(title=html.escape(item["title"])),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(f"ch_view_{item_id}"),
+        )
+
     elif data.startswith("ch_now_"):
         item_id = int(data.split("_")[-1])
         item = await get_item(item_id)
@@ -1198,6 +1322,13 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         err = await set_item_expiry(item_id, None)
         if err:
             await query.edit_message_text(f"❌ ذخیره نشد:\n{err}", reply_markup=back_kb(f"ch_view_{item_id}"))
+            return
+        if item.get("quota_done"):
+            await query.edit_message_text(
+                f"تعرفه‌ی ممبرِ «{item['title']}» قبلاً کامل شده است. برای فعال‌سازی دوباره، "
+                "از دکمه‌ی «🎯 تعرفه‌ی ممبر» تعداد جدید را ثبت کنید.",
+                reply_markup=back_kb(f"ch_view_{item_id}"),
+            )
             return
         await query.edit_message_text(
             f"«{item['title']}» هم‌اکنون فعال شد و محدودیت زمانی ندارد ✅", reply_markup=CHANNELS_MENU
@@ -1282,6 +1413,24 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"زمان حذف پیام هشدار: {delete_seconds:g} ثانیه"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_kb("menu_main"))
+
+
+QUOTA_PROMPT = (
+    "تعداد ممبر مورد نیازِ «<b>{title}</b>» را بفرستید.\n\n"
+    "• عدد دلخواه، مثلاً <code>200</code>: وقتی همین تعداد کاربر جدید عضو شدند، "
+    "این مورد خودکار از جوین اجباری برداشته می‌شود.\n"
+    "• <code>0</code>: نامحدود (تا وقتی دستی حذف یا زمان‌بندی نشود فعال می‌ماند).\n\n"
+    "شمارش از همین لحظه شروع می‌شود."
+)
+
+
+def parse_member_limit(text: str) -> Optional[int]:
+    """عدد صحیح غیرمنفی (ارقام فارسی/عربی و جداکننده‌ی هزارگان پشتیبانی می‌شود)؛ نامعتبر = None."""
+    cleaned = (text or "").translate(_PERSIAN_DIGITS).strip().replace(",", "").replace("٬", "").replace(" ", "")
+    if not cleaned.isdigit():
+        return None
+    value = int(cleaned)
+    return value if value <= MAX_MEMBER_LIMIT else None
 
 
 def _extract_link_or_generate(chat_full, username: Optional[str]) -> Optional[str]:
@@ -1423,10 +1572,11 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             added = await get_item_by_chat_id(str(chat_full.id))
             if added:
+                PENDING_ITEM_QUOTA[user_id] = (added["id"], True)
                 await message.reply_text(
                     f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅\n\n"
-                    "همین حالا فعال شود یا برایش زمان تنظیم کنید؟",
-                    reply_markup=build_schedule_keyboard(added["id"]),
+                    + QUOTA_PROMPT.format(title=html.escape(chat_full.title)),
+                    parse_mode=ParseMode.HTML,
                 )
             else:
                 await message.reply_text(
@@ -1529,13 +1679,70 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         added = await get_item_by_chat_id(username)
-        await message.reply_text(
-            f"ربات «{title}» اضافه شد ✅\n"
-            f"لینک استارت: {deep_link}\n\n"
-            "همین حالا فعال شود یا برایش زمان تنظیم کنید؟",
-            reply_markup=build_schedule_keyboard(added["id"]) if added else CHANNELS_MENU,
-            disable_web_page_preview=True,
+        if added:
+            PENDING_ITEM_QUOTA[user_id] = (added["id"], True)
+            await message.reply_text(
+                f"ربات «{title}» اضافه شد ✅\n"
+                f"لینک استارت: {deep_link}\n\n"
+                + QUOTA_PROMPT.format(title=html.escape(title)),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        else:
+            await message.reply_text(
+                f"ربات «{title}» اضافه شد ✅\nلینک استارت: {deep_link}",
+                reply_markup=CHANNELS_MENU,
+                disable_web_page_preview=True,
+            )
+        return
+
+    # حالت: دریافت تعرفه‌ی ممبر
+    if user_id in PENDING_ITEM_QUOTA:
+        item_id, just_added = PENDING_ITEM_QUOTA[user_id]
+        limit = parse_member_limit(message.text or "")
+        if limit is None:
+            await message.reply_text(
+                "عدد نامعتبر است. یک عدد صحیح بفرستید (مثلاً 200)، یا 0 برای نامحدود."
+            )
+            return
+        PENDING_ITEM_QUOTA.pop(user_id, None)
+        item = await get_item(item_id)
+        if not item:
+            await message.reply_text("این آیتم دیگر وجود ندارد.", reply_markup=CHANNELS_MENU)
+            return
+        baseline = None
+        if limit > 0:
+            try:
+                if item.get("kind") == "bot":
+                    baseline = await count_bot_starts(item["chat_id"])
+                else:
+                    baseline = await context.bot.get_chat_member_count(item["chat_id"])
+            except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+                await message.reply_text(
+                    f"❌ گرفتن تعداد فعلی اعضا ممکن نبود، تعرفه ثبت نشد. مطمئن شوید ربات در آن ادمین است.\n({exc})"
+                )
+                PENDING_ITEM_QUOTA[user_id] = (item_id, just_added)
+                return
+        err = await set_item_quota(item_id, limit, baseline)
+        if err:
+            await message.reply_text(f"❌ ذخیره نشد:\n{err}")
+            return
+        item = await get_item(item_id)
+        note = (
+            "نامحدود ثبت شد ✅"
+            if limit == 0
+            else f"تعرفه ثبت شد ✅ بعد از ورود {limit:,} کاربر جدید، «{item['title']}» خودکار از جوین اجباری برداشته می‌شود."
         )
+        if just_added and item:
+            await message.reply_text(
+                f"{note}\n\nهمین حالا فعال شود یا برایش زمان هم تنظیم کنید؟",
+                reply_markup=build_schedule_keyboard(item["id"]),
+            )
+        else:
+            count = await fetch_member_count(context.bot, item) if item else None
+            await message.reply_text(
+                note, reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU
+            )
         return
 
     # حالت: تنظیم مدت فعال بودن آیتم
@@ -1660,9 +1867,11 @@ async def _telegram_webhook(request: web.Request) -> web.Response:
 
 
 async def _on_startup(app: web.Application) -> None:
+    global _quota_bot
     application: Application = app["application"]
     await application.initialize()
     await application.start()
+    _quota_bot = application.bot
 
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
     await application.bot.set_webhook(
