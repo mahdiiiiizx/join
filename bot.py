@@ -29,7 +29,8 @@
         expires_at timestamptz,                 -- زمان پایان جوین اجباریِ این آیتم (خالی = بدون محدودیت)
         start_members bigint,                   -- تعداد اعضا در لحظه‌ی ثبت آیتم (مبنای شمارش ورودی‌ها)
         member_limit bigint,                    -- تعرفه‌ی ممبر: تعداد ورودی مورد نیاز (خالی/0 = نامحدود)
-        quota_done boolean not null default false  -- true = تعرفه کامل شد و آیتم از جوین اجباری کنار رفته
+        quota_done boolean not null default false,  -- true = تعرفه کامل شد و آیتم از جوین اجباری کنار رفته
+        peak_members bigint not null default 0  -- بیشترین تعداد ورودیِ تا به حال دیده‌شده (هیچ‌وقت با ترک‌کردن کم نمی‌شود)
     );
 
     -- اگر جدول channels را قبلاً ساخته‌اید، فقط این را اجرا کنید:
@@ -37,6 +38,7 @@
     alter table channels add column if not exists start_members bigint;
     alter table channels add column if not exists member_limit bigint;
     alter table channels add column if not exists quota_done boolean not null default false;
+    alter table channels add column if not exists peak_members bigint not null default 0;
 
     create table if not exists texts (
         key text primary key,
@@ -413,6 +415,7 @@ async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> O
     payload: dict = {"member_limit": limit, "quota_done": False}
     if limit > 0 and baseline is not None:
         payload["start_members"] = baseline
+        payload["peak_members"] = 0  # شروع دوره‌ی شمارش جدید؛ پیک دوره‌ی قبل اعتبار ندارد
 
     def _run():
         supabase.table("channels").update(payload).eq("id", item_id).execute()
@@ -1095,8 +1098,22 @@ async def _save_start_members(item_id: int, value: int) -> None:
     _cache_clear()
 
 
+async def _save_peak_members(item_id: int, value: int) -> None:
+    def _run():
+        supabase.table("channels").update({"peak_members": value}).eq("id", item_id).execute()
+
+    await asyncio.to_thread(_safe_db, _run, None)
+    _cache_clear()
+
+
 async def fetch_member_count(bot, item: dict, force: bool = False) -> Optional[int]:
-    """تعداد کاربرانی که از لحظه‌ی ثبت آیتم تا الان وارد شده‌اند = تعداد فعلی − تعداد اولیه. خطا = None."""
+    """
+    تعداد ورودی‌های آیتم از لحظه‌ی ثبت تا الان.
+    شمارش فقط افزایشی است: اگر کسی گروه/کانال مقصد را ترک کند، عدد کم نمی‌شود،
+    چون مبنای نمایش «بیشترین مقداری که تا الان دیده شده» (peak_members) است، نه
+    تعداد لحظه‌ایِ اعضا. خطا در دریافت تعداد زنده = None (در این حالت هم همان
+    peak ذخیره‌شده را برمی‌گردانیم تا عدد به‌خاطر یک خطای موقت افت نکند).
+    """
     key = str(item["chat_id"])
     now = time.monotonic()
     hit = _member_count_cache.get(key)
@@ -1111,7 +1128,7 @@ async def fetch_member_count(bot, item: dict, force: bool = False) -> Optional[i
         except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
             logger.warning("خطا در دریافت تعداد اعضای %s: %s", item.get("title"), exc)
             if not hit:
-                return None
+                return item.get("peak_members") or 0
             current = hit[1]
         else:
             _member_count_cache[key] = (now, current)
@@ -1121,8 +1138,15 @@ async def fetch_member_count(bot, item: dict, force: bool = False) -> Optional[i
         # آیتم‌های قدیمی که مبنا ندارند: از همین لحظه شروع به شمارش می‌کنند
         item["start_members"] = current
         await _save_start_members(item["id"], current)
-        return 0
-    return max(0, current - baseline)
+        baseline = current
+
+    live = max(0, current - baseline)
+    peak = item.get("peak_members") or 0
+    if live > peak:
+        item["peak_members"] = live  # روی دیکشنری کش‌شده هم بلافاصله اعمال شود
+        await _save_peak_members(item["id"], live)
+        return live
+    return peak
 
 
 async def fetch_member_counts(bot, items: list, force: bool = False) -> dict:
