@@ -39,6 +39,7 @@
     alter table channels add column if not exists member_limit bigint;
     alter table channels add column if not exists quota_done boolean not null default false;
     alter table channels add column if not exists peak_members bigint not null default 0;
+    alter table channels add column if not exists fake_members bigint not null default 0;
 
     create table if not exists texts (
         key text primary key,
@@ -398,12 +399,22 @@ def item_member_limit(item: dict) -> int:
         return 0
 
 
+def get_fake_members(item: dict) -> int:
+    """تعداد ممبر الکی که ادمین اضافه کرده."""
+    try:
+        return max(int(item.get("fake_members") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def format_quota(item: dict, joined: Optional[int]) -> str:
     limit = item_member_limit(item)
+    fake = get_fake_members(item)
+    display = (joined + fake) if isinstance(joined, int) else joined
     if limit <= 0:
         # نامحدود: تعداد ورودی‌ها همچنان نمایش داده می‌شود
-        return f"{format_count(joined)} / نامحدود"
-    return f"{format_count(joined)} / {limit:,}"
+        return f"{format_count(display)} / نامحدود"
+    return f"{format_count(display)} / {limit:,}"
 
 
 async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> Optional[str]:
@@ -429,6 +440,26 @@ async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> O
         logger.error("خطای دیتابیس هنگام ثبت تعرفه‌ی ممبر: %s", exc)
         if "member_limit" in str(exc) or "quota_done" in str(exc):
             return MEMBER_LIMIT_MISSING_HINT
+        return str(exc)
+
+
+async def add_fake_members(item_id: int, extra: int) -> Optional[str]:
+    """
+    افزایش شمارنده‌ی ممبر الکی برای یک آیتم.
+    عدد نمایشی = ورودی‌های واقعی + fake_members
+    """
+    def _run():
+        existing = supabase.table("channels").select("fake_members").eq("id", item_id).execute().data
+        current_fake = int((existing[0].get("fake_members") or 0) if existing else 0)
+        supabase.table("channels").update({"fake_members": current_fake + extra}).eq("id", item_id).execute()
+
+    try:
+        await asyncio.to_thread(_run)
+        _cache_clear()
+        _member_count_cache.clear()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.error("خطای دیتابیس هنگام افزایش ممبر الکی: %s", exc)
         return str(exc)
 
 
@@ -699,6 +730,7 @@ PENDING_BOT_ADD: set = set()
 PENDING_LINK_EDIT: dict = {}
 PENDING_ITEM_TIME: dict = {}   # user_id -> item_id (منتظر مدت زمان)
 PENDING_ITEM_QUOTA: dict = {}  # user_id -> (item_id، آیا بلافاصله بعد از افزودن است؟) منتظر تعداد ممبر
+PENDING_FAKE_MEMBERS: dict = {}  # user_id -> item_id (منتظر عدد افزایش ممبر الکی)
 PENDING_GROUP_SET: set = set()
 PENDING_DELETE_TIMER_SET: set = set()
 
@@ -1175,14 +1207,17 @@ def build_list_keyboard(items: list, counts: Optional[dict] = None) -> InlineKey
 
 
 def build_item_manage_keyboard(item: dict, count: Optional[int] = None) -> InlineKeyboardMarkup:
+    fake = get_fake_members(item)
+    fake_label = f" (+{fake:,} الکی)" if fake > 0 else ""
     rows = [
         [
             InlineKeyboardButton("⚡ تنظیم هم اکنون", callback_data=f"ch_now_{item['id']}", style="success"),
             InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item['id']}", style="primary"),
         ],
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
-        [InlineKeyboardButton(f"👥 {format_quota(item, count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton(f"👥 {format_quota(item, count)}{fake_label}", callback_data=f"ch_count_{item['id']}", style="primary")],
         [InlineKeyboardButton("🎯 تعرفه‌ی ممبر", callback_data=f"ch_quota_{item['id']}", style="primary")],
+        [InlineKeyboardButton("➕ افزایش ممبر", callback_data=f"ch_fake_{item['id']}", style="primary")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
     ]
@@ -1226,6 +1261,8 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         PENDING_ITEM_TIME.pop(user_id, None)
     if not data.startswith("ch_quota_"):
         PENDING_ITEM_QUOTA.pop(user_id, None)
+    if not data.startswith("ch_fake_"):
+        PENDING_FAKE_MEMBERS.pop(user_id, None)
 
     if data == "menu_main":
         await query.edit_message_text("پنل مدیریت:", reply_markup=MAIN_MENU)
@@ -1323,6 +1360,23 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
                 raise
+
+    elif data.startswith("ch_fake_"):
+        item_id = int(data.split("_")[-1])
+        item = await get_item(item_id)
+        if not item:
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
+            return
+        PENDING_FAKE_MEMBERS[user_id] = item_id
+        fake = get_fake_members(item)
+        fake_note = f"\n\nتعداد فعلی ممبر الکی: <b>{fake:,}</b>" if fake > 0 else ""
+        await query.edit_message_text(
+            f"چند ممبر الکی به «<b>{html.escape(item['title'])}</b>» اضافه شود؟{fake_note}\n\n"
+            "یک عدد مثبت وارد کنید (مثلاً <code>100</code>).\n"
+            "این عدد فقط در نمایش پنل ادمین به تعداد واقعی اضافه می‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(f"ch_view_{item_id}"),
+        )
 
     elif data.startswith("ch_quota_"):
         item_id = int(data.split("_")[-1])
@@ -1682,13 +1736,18 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         if m:
             username = m.group(1)
             query_string = m.group(2) or ""
-            deep_link = f"https://t.me/{username}" + (f"?{query_string}" if "start=" in query_string else "?start=verify_join")
+            # اگر لینک شامل پارامتر start= بود همان رو نگه‌داریم؛ وگرنه فقط لینک ساده
+            if "start=" in query_string:
+                deep_link = f"https://t.me/{username}?{query_string}"
+            else:
+                deep_link = f"https://t.me/{username}"
         else:
             username = raw.lstrip("@")
             if not re.match(r"^[A-Za-z0-9_]{5,32}$", username):
                 await message.reply_text("یوزرنیم یا لینک نامعتبر است.")
                 return
-            deep_link = f"https://t.me/{username}?start=verify_join"
+            # یوزرنیم ساده (@username) → لینک مستقیم بدون پارامتر اضافی
+            deep_link = f"https://t.me/{username}"
 
         title = username
         try:
@@ -1807,6 +1866,35 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         item = await get_item(item_id)
         count = await fetch_member_count(context.bot, item) if item else None
         await message.reply_text("لینک به‌روزرسانی شد ✅", reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU)
+        return
+
+    # حالت: افزایش ممبر الکی
+    if user_id in PENDING_FAKE_MEMBERS:
+        item_id = PENDING_FAKE_MEMBERS.pop(user_id)
+        raw = (message.text or "").strip()
+        extra = parse_member_limit(raw)
+        if extra is None or extra <= 0:
+            await message.reply_text(
+                "عدد نامعتبر است. یک عدد صحیح مثبت وارد کنید (مثلاً <code>100</code>).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb(f"ch_view_{item_id}"),
+            )
+            PENDING_FAKE_MEMBERS[user_id] = item_id  # برگردان به حالت انتظار
+            return
+        err = await add_fake_members(item_id, extra)
+        if err:
+            await message.reply_text(
+                f"❌ ذخیره در دیتابیس شکست خورد:\n<code>{err}</code>", parse_mode=ParseMode.HTML
+            )
+            return
+        item = await get_item(item_id)
+        count = await fetch_member_count(context.bot, item) if item else None
+        total_fake = get_fake_members(item) if item else extra
+        await message.reply_text(
+            f"✅ {extra:,} ممبر الکی اضافه شد.\nجمع ممبر الکی: <b>{total_fake:,}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU,
+        )
         return
 
     # حالت: تنظیم زمان حذف خودکار پیام هشدار
