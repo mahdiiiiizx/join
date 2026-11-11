@@ -1513,10 +1513,12 @@ def parse_member_limit(text: str) -> Optional[int]:
 
 
 def _extract_link_or_generate(chat_full, username: Optional[str]) -> Optional[str]:
-    if chat_full.invite_link:
-        return chat_full.invite_link
+    # اولویت اول: یوزرنیم عمومی — لینک خصوصی ساخته نمی‌شود
     if username:
         return f"https://t.me/{username}"
+    # اگر یوزرنیم ندارد، از invite_link تلگرام استفاده می‌کنیم
+    if chat_full.invite_link:
+        return chat_full.invite_link
     return None
 
 
