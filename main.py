@@ -64,6 +64,7 @@
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -85,6 +86,8 @@ from telegram import (
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
+
+import report_image
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -107,6 +110,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
 ADMIN_IDS = {601668306, 8977934490, 7020087811}
+
+REPORT_RECIPIENT_IDS = set(ADMIN_IDS)       # گزارش تصویری برای این آیتم‌ها (ادمین‌های ربات) ارسال می‌شود
+BACKGROUND_INTERVAL_SECONDS = 30            # فاصله‌ی بررسی آیتم‌های تمام‌شده برای ارسال گزارش
 
 DEFAULT_WARN_TEXT = "<b>کاربر {mention}\nبرای ارسال پیام باید در موارد زیر عضو شوید:</b>"
 DEFAULT_JOINED_TEXT = "<b>کاربر {mention} در همه‌ی موارد عضو شد ✅</b>"
@@ -364,6 +370,11 @@ async def set_item_expiry(item_id: int, expires_at: Optional[datetime]) -> Optio
 
     def _run():
         supabase.table("channels").update({"expires_at": value}).eq("id", item_id).execute()
+        try:
+            # فعال‌سازی دوباره = گزارش پایانِ جدید در آینده (آیتمی که تعرفه‌اش کامل شده فعال نمی‌شود، پس ریست نمی‌شود)
+            supabase.table("channels").update({"report_sent": False}).eq("id", item_id).eq("quota_done", "false").execute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ریست report_sent ممکن نشد (migration اجرا شده؟): %s", exc)
 
     try:
         await asyncio.to_thread(_run)
@@ -421,7 +432,7 @@ async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> O
     با هر ثبت، شمارش از همین لحظه شروع می‌شود (baseline = تعداد فعلی اعضا) و وضعیت «تکمیل‌شده» ریست می‌شود.
     در صورت خطا متن خطا را برمی‌گرداند.
     """
-    payload: dict = {"member_limit": limit, "quota_done": False}
+    payload: dict = {"member_limit": limit, "quota_done": False, "report_sent": False}  # تعرفه‌ی جدید = گزارش پایانِ جدید
     if limit > 0 and baseline is not None:
         payload["start_members"] = baseline
         payload["peak_members"] = 0  # شروع دوره‌ی شمارش جدید؛ پیک دوره‌ی قبل اعتبار ندارد
@@ -470,6 +481,9 @@ async def _mark_quota_done(item: dict) -> None:
     await asyncio.to_thread(_safe_db, _run, None)
     _cache_clear()
     logger.info("تعرفه‌ی ممبر «%s» کامل شد و از جوین اجباری کنار رفت.", item.get("title"))
+    if _quota_bot is not None:
+        task = asyncio.create_task(send_item_report(_quota_bot, item, reason="quota"))
+        task.add_done_callback(_log_task_exception)
 
 
 async def _enforce_quotas(items: list) -> None:
@@ -1205,21 +1219,160 @@ def build_list_keyboard(items: list, counts: Optional[dict] = None) -> InlineKey
 
 
 def build_item_manage_keyboard(item: dict, count: Optional[int] = None) -> InlineKeyboardMarkup:
-    fake = get_fake_members(item)
-    fake_label = f" (+{fake:,} الکی)" if fake > 0 else ""
     rows = [
         [
             InlineKeyboardButton("⚡ تنظیم هم اکنون", callback_data=f"ch_now_{item['id']}", style="success"),
             InlineKeyboardButton("⏰ تنظیم زمان", callback_data=f"ch_time_{item['id']}", style="primary"),
         ],
         [InlineKeyboardButton("✏️ تغییر لینک", callback_data=f"ch_editlink_{item['id']}", style="primary")],
-        [InlineKeyboardButton(f"👥 {format_quota(item, count)}{fake_label}", callback_data=f"ch_count_{item['id']}", style="primary")],
+        [InlineKeyboardButton(f"👥 {format_quota(item, count)}", callback_data=f"ch_count_{item['id']}", style="primary")],
         [InlineKeyboardButton("🎯 تعرفه‌ی ممبر", callback_data=f"ch_quota_{item['id']}", style="primary")],
         [InlineKeyboardButton("➕ افزایش ممبر", callback_data=f"ch_fake_{item['id']}", style="primary")],
+        [InlineKeyboardButton("🖼 گزارش تصویری", callback_data=f"ch_report_{item['id']}", style="success")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"ch_del_{item['id']}", style="danger")],
         [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="ch_list")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+_report_failed_logged: set = set()
+
+REPORT_REASON_LABEL = {
+    "quota": "تعرفه‌ی ممبر کامل شد",
+    "expired": "زمان جوین اجباری تمام شد",
+    "removed": "از جوین اجباری برداشته شد",
+}
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("خطای پردازش‌نشده در تسک: %s", exc, exc_info=exc)
+
+
+def _item_end_reason(item: dict) -> str:
+    return "quota" if item.get("quota_done") else "expired"
+
+
+async def claim_report(item_id: int) -> bool:
+    """ادعای اتمیکِ «گزارش این آیتم را من می‌فرستم»؛ فقط یک تسک موفق می‌شود."""
+
+    def _run():
+        res = (
+            supabase.table("channels").update({"report_sent": True})
+            .eq("id", item_id).eq("report_sent", "false").execute()
+        )
+        return bool(res.data)
+
+    try:
+        ok = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        if item_id not in _report_failed_logged:
+            _report_failed_logged.add(item_id)
+            logger.error("ثبت report_sent ممکن نشد (migration_v2.sql اجرا شده؟): %s", exc)
+        return False
+    if ok:
+        _cache_clear()
+    return ok
+
+
+async def release_report(item_id: int) -> None:
+    await asyncio.to_thread(
+        _safe_db, lambda: supabase.table("channels").update({"report_sent": False}).eq("id", item_id).execute()
+    )
+    _cache_clear()
+
+
+async def build_item_report_png(bot, item: dict) -> bytes:
+    """گزارش قبل/بعد فقط با اعداد واقعی ساخته می‌شود (ممبر الکی در تصویر نمی‌آید)."""
+    kind = item.get("kind", "channel")
+    joined = await fetch_member_count(bot, item, force=True) or 0
+
+    chat_ref = f"@{item['chat_id']}" if kind == "bot" else item["chat_id"]
+    name = item["title"]
+    photo_bytes = None
+    try:
+        chat = await bot.get_chat(chat_ref)
+        name = getattr(chat, "title", None) or getattr(chat, "full_name", None) or name
+        if chat.photo is not None:
+            tg_file = await bot.get_file(chat.photo.big_file_id)
+            photo_bytes = bytes(await tg_file.download_as_bytearray())
+    except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+        logger.warning("دریافت پروفایل «%s» برای گزارش ممکن نشد: %s", item.get("title"), exc)
+
+    before = item.get("start_members") if isinstance(item.get("start_members"), int) else None
+    after = None
+    try:
+        after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
+    except (BadRequest, Forbidden, TimedOut, NetworkError):
+        pass
+
+    return await asyncio.to_thread(report_image.render_report, name, photo_bytes, joined, before, after)
+
+
+async def send_item_report(bot, item: dict, reason: str = "expired", claim: bool = True, recipients=None) -> bool:
+    """
+    گزارش تصویری «قبل و بعد» را برای ادمین‌های ربات می‌فرستد.
+    claim=True: فقط یک‌بار برای هر دوره (بعد از پایان جوین اجباری)؛ claim=False: دکمه‌ی دستی پنل.
+    """
+    if claim:
+        if not await claim_report(item["id"]):
+            return False
+        item["report_sent"] = True
+    try:
+        png = await build_item_report_png(bot, item)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("ساخت گزارش تصویری «%s» ناموفق بود: %s", item.get("title"), exc, exc_info=exc)
+        if claim:
+            await release_report(item["id"])
+            item["report_sent"] = False
+        return False
+
+    joined = await fetch_member_count(bot, item) or 0
+    caption = (
+        f"📊 <b>{html.escape(item['title'])}</b>\n"
+        f"✅ ممبر جذب‌شده از طریق ربات: <b>{joined:,}</b>\n"
+        f"🏁 {REPORT_REASON_LABEL.get(reason, REPORT_REASON_LABEL['expired'])}"
+    )
+    sent_any = False
+    for uid in (recipients if recipients is not None else REPORT_RECIPIENT_IDS):
+        for attempt in range(2):
+            try:
+                await bot.send_photo(chat_id=uid, photo=io.BytesIO(png), caption=caption, parse_mode=ParseMode.HTML)
+                sent_any = True
+                break
+            except RetryAfter as exc:
+                wait = exc.retry_after
+                wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+                await asyncio.sleep(wait + 0.2)
+            except TelegramError as exc:
+                logger.warning("ارسال گزارش برای %s ناموفق (ادمین باید ربات را استارت کرده باشد): %s", uid, exc)
+                break
+    if claim and not sent_any:
+        await release_report(item["id"])
+        item["report_sent"] = False
+    return sent_any
+
+
+async def _sweep_finished_items(bot) -> None:
+    """آیتم‌هایی که جوین اجباری‌شان تمام شده (تعرفه یا زمان) و هنوز گزارش تصویری نگرفته‌اند."""
+    await list_items()  # اجرای بررسی تعرفه‌ها
+    for item in await list_all_items():
+        if item_is_expired(item) and not item.get("report_sent"):
+            await send_item_report(bot, item, reason=_item_end_reason(item))
+
+
+async def _background_loop(application: Application) -> None:
+    while True:
+        try:
+            await asyncio.sleep(BACKGROUND_INTERVAL_SECONDS)
+            await _sweep_finished_items(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("خطا در حلقه‌ی پس‌زمینه: %s", exc, exc_info=exc)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1376,6 +1529,16 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=back_kb(f"ch_view_{item_id}"),
         )
 
+    elif data.startswith("ch_report_"):
+        item_id = int(data.split("_")[-1])
+        item = await get_item(item_id)
+        if not item:
+            await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
+            return
+        ok = await send_item_report(context.bot, item, reason=_item_end_reason(item), claim=False, recipients={user_id})
+        if not ok:
+            await context.bot.send_message(chat_id=user_id, text="❌ ساخت یا ارسال گزارش تصویری ناموفق بود. لاگ سرور را ببینید.")
+
     elif data.startswith("ch_quota_"):
         item_id = int(data.split("_")[-1])
         item = await get_item(item_id)
@@ -1429,6 +1592,10 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif data.startswith("ch_del_"):
         item_id = int(data.split("_")[-1])
+        doomed = await get_item(item_id)
+        if doomed and not doomed.get("report_sent"):
+            # قبل از حذف، گزارش تصویریِ نهایی ساخته و ارسال می‌شود
+            await send_item_report(context.bot, doomed, reason="removed")
         removed = await remove_item_by_id(item_id)
         items = await list_all_items()
         msg = "حذف شد ✅" if removed else "حذف نشد، دوباره تلاش کنید."
@@ -1949,6 +2116,21 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # اجرای ربات (Polling)
 # ---------------------------------------------------------------------------
 
+_background_task: Optional[asyncio.Task] = None
+
+
+async def _on_post_init(application: Application) -> None:
+    global _quota_bot, _background_task
+    _quota_bot = application.bot  # برای بررسی تعرفه‌ها و ارسال گزارش از داخل list_items
+    _background_task = asyncio.create_task(_background_loop(application))
+    _background_task.add_done_callback(_log_task_exception)
+
+
+async def _on_post_shutdown(application: Application) -> None:
+    if _background_task is not None:
+        _background_task.cancel()
+
+
 def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند.")
@@ -1983,10 +2165,14 @@ def main() -> None:
         MessageHandler(filters.ChatType.PRIVATE & filters.ALL, owner_private_message)
     )
 
+    application.post_init = _on_post_init
+    application.post_shutdown = _on_post_shutdown
+
     logger.info("ربات در حال اجراست (polling)...")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
+
 if __name__ == "__main__":
     main()
