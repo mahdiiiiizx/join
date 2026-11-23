@@ -1250,6 +1250,7 @@ REPORT_REASON_LABEL = {
     "quota": "تعرفه‌ی ممبر کامل شد",
     "expired": "زمان جوین اجباری تمام شد",
     "removed": "از جوین اجباری برداشته شد",
+    "fake_add": "افزایش ممبر الکی ثبت شد",
 }
 
 
@@ -2083,8 +2084,15 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             done = f"✅ {abs(applied):,} ممبر کم شد."
         else:
             done = f"✅ {applied:,} ممبر اضافه شد."
+
+        report_note = ""
+        if mode == "add" and item:
+            # افزایش ممبر فیک مستقیماً در عکس گزارش هم ثبت و ارسال می‌شود
+            sent = await send_item_report(context.bot, item, reason="fake_add", claim=False, recipients={user_id})
+            report_note = "\n🖼 عکس گزارش هم ثبت و ارسال شد." if sent else "\n⚠️ ساخت/ارسال عکس گزارش ناموفق بود."
+
         await message.reply_text(
-            f"{done}\nجمع تعدیل ممبر: <b>{total_fake:+,}</b>",
+            f"{done}\nجمع تعدیل ممبر: <b>{total_fake:+,}</b>{report_note}",
             parse_mode=ParseMode.HTML,
             reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU,
         )
