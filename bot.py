@@ -409,9 +409,9 @@ def item_member_limit(item: dict) -> int:
 
 
 def get_fake_members(item: dict) -> int:
-    """تعداد ممبر الکی که ادمین اضافه کرده."""
+    """تعدادِ تعدیل ممبر ادمین؛ مثبت = افزایش، منفی = کاهش."""
     try:
-        return max(int(item.get("fake_members") or 0), 0)
+        return int(item.get("fake_members") or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -419,7 +419,7 @@ def get_fake_members(item: dict) -> int:
 def format_quota(item: dict, joined: Optional[int]) -> str:
     limit = item_member_limit(item)
     fake = get_fake_members(item)
-    display = (joined + fake) if isinstance(joined, int) else joined
+    display = max(joined + fake, 0) if isinstance(joined, int) else joined
     if limit <= 0:
         # نامحدود: تعداد ورودی‌ها همچنان نمایش داده می‌شود
         return f"{format_count(display)} / نامحدود"
@@ -455,15 +455,15 @@ async def set_item_quota(item_id: int, limit: int, baseline: Optional[int]) -> O
 async def adjust_fake_members(item_id: int, delta: int) -> tuple:
     """
     تغییر شمارنده‌ی ممبر الکی (delta مثبت = افزایش، منفی = کاهش).
-    عدد نمایشی = ورودی‌های واقعی + fake_members؛ مقدار هرگز زیر صفر نمی‌رود.
+    عدد نمایشی = ورودی‌های واقعی + fake_members (fake_members منفی هم می‌شود؛ عدد نمایشی زیر صفر نمی‌رود).
     خروجی: (متن خطا یا None، مقدار جدید fake_members، مقدار واقعاً تغییرکرده)
     """
     result: dict = {}
 
     def _run():
         existing = supabase.table("channels").select("fake_members").eq("id", item_id).execute().data
-        current_fake = max(int((existing[0].get("fake_members") or 0) if existing else 0), 0)
-        new_fake = max(current_fake + delta, 0)
+        current_fake = int((existing[0].get("fake_members") or 0) if existing else 0)
+        new_fake = current_fake + delta  # می‌تواند منفی شود تا عدد نمایشی از تعداد واقعی کمتر هم بشود
         supabase.table("channels").update({"fake_members": new_fake}).eq("id", item_id).execute()
         result["new"] = new_fake
         result["applied"] = new_fake - current_fake
@@ -1300,7 +1300,7 @@ async def build_item_report_png(bot, item: dict) -> bytes:
     fake = get_fake_members(item)
 
     real_joined = await fetch_member_count(bot, item, force=True) or 0
-    joined = real_joined + fake  # عدد سبز +N مطابق نمایش پنل
+    joined = max(real_joined + fake, 0)  # عدد سبز +N مطابق نمایش پنل
 
     chat_ref = f"@{item['chat_id']}" if kind == "bot" else item["chat_id"]
     name = item["title"]
@@ -1328,7 +1328,7 @@ async def build_item_report_png(bot, item: dict) -> bytes:
             raw_after = await count_bot_starts(item["chat_id"]) if kind == "bot" else await bot.get_chat_member_count(item["chat_id"])
         except (BadRequest, Forbidden, TimedOut, NetworkError):
             pass
-        after = (raw_after + fake) if isinstance(raw_after, int) else None
+        after = max(raw_after + fake, 0) if isinstance(raw_after, int) else None
 
     return await asyncio.to_thread(report_image.render_report, name, photo_bytes, joined, before, after)
 
@@ -1351,7 +1351,7 @@ async def send_item_report(bot, item: dict, reason: str = "expired", claim: bool
             item["report_sent"] = False
         return False
 
-    joined = (await fetch_member_count(bot, item) or 0) + get_fake_members(item)  # مطابق عدد سبز تصویر
+    joined = max((await fetch_member_count(bot, item) or 0) + get_fake_members(item), 0)  # مطابق عدد سبز تصویر
     caption = (
         f"📊 <b>{html.escape(item['title'])}</b>\n"
         f"✅ ممبر جذب‌شده از طریق ربات: <b>{joined:,}</b>\n"
@@ -1541,16 +1541,13 @@ async def owner_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("این آیتم دیگر وجود ندارد.", reply_markup=back_kb("ch_list"))
             return
         fake = get_fake_members(item)
-        if mode == "sub" and fake <= 0:
-            await query.answer("ممبر الکی‌ای برای کاهش وجود ندارد.", show_alert=True)
-            return
         PENDING_FAKE_MEMBERS[user_id] = (item_id, mode)
-        fake_note = f"\n\nتعداد فعلی ممبر الکی: <b>{fake:,}</b>" if fake > 0 else ""
+        fake_note = f"\n\nتعدیل فعلی ممبر: <b>{fake:+,}</b>" if fake != 0 else ""
         verb = "کم" if mode == "sub" else "اضافه"
         await query.edit_message_text(
-            f"چند ممبر الکی از «<b>{html.escape(item['title'])}</b>» {verb} شود؟{fake_note}\n\n"
+            f"چند ممبر از «<b>{html.escape(item['title'])}</b>» {verb} شود؟{fake_note}\n\n"
             "یک عدد مثبت وارد کنید (مثلاً <code>100</code>)."
-            + ("\nاگر عدد از ممبر الکی موجود بیشتر باشد، ممبر الکی صفر می‌شود." if mode == "sub" else ""),
+            + ("\nاین عدد از تعداد نمایشی کم می‌شود (در پنل و تصویر گزارش)." if mode == "sub" else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb(f"ch_view_{item_id}"),
         )
@@ -2083,13 +2080,11 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         item = await get_item(item_id)
         count = await fetch_member_count(context.bot, item) if item else None
         if mode == "sub":
-            done = f"✅ {abs(applied):,} ممبر الکی کم شد."
-            if abs(applied) < amount:
-                done += f"\n(فقط {abs(applied):,} ممبر الکی وجود داشت.)"
+            done = f"✅ {abs(applied):,} ممبر کم شد."
         else:
-            done = f"✅ {applied:,} ممبر الکی اضافه شد."
+            done = f"✅ {applied:,} ممبر اضافه شد."
         await message.reply_text(
-            f"{done}\nجمع ممبر الکی: <b>{total_fake:,}</b>",
+            f"{done}\nجمع تعدیل ممبر: <b>{total_fake:+,}</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=build_item_manage_keyboard(item, count) if item else CHANNELS_MENU,
         )
