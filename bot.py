@@ -364,12 +364,20 @@ EXPIRES_AT_MISSING_HINT = (
 )
 
 
-async def set_item_expiry(item_id: int, expires_at: Optional[datetime]) -> Optional[str]:
+async def set_item_expiry(
+    item_id: int, expires_at: Optional[datetime], duration: Optional[timedelta] = None
+) -> Optional[str]:
     """expires_at=None یعنی فعال‌سازی هم‌اکنون بدون محدودیت زمانی. در صورت خطا متن خطا را برمی‌گرداند."""
     value = expires_at.isoformat() if expires_at else None
+    duration_value = int(duration.total_seconds()) if (duration and expires_at) else None
 
     def _run():
         supabase.table("channels").update({"expires_at": value}).eq("id", item_id).execute()
+        try:
+            # مدت انتخاب‌شده برای متن گزارش پایان (ستون duration_seconds در migration_v3.sql)
+            supabase.table("channels").update({"duration_seconds": duration_value}).eq("id", item_id).execute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ثبت duration_seconds ممکن نشد (migration_v3.sql اجرا شده؟): %s", exc)
         try:
             # فعال‌سازی دوباره = گزارش پایانِ جدید در آینده (آیتمی که تعرفه‌اش کامل شده فعال نمی‌شود، پس ریست نمی‌شود)
             supabase.table("channels").update({"report_sent": False}).eq("id", item_id).eq("quota_done", "false").execute()
@@ -1324,6 +1332,49 @@ async def build_item_report_png(bot, item: dict) -> bytes:
     return await asyncio.to_thread(report_image.render_report, name, photo_bytes, joined, before, after)
 
 
+REPORT_KIND_LINE = {"group": "🚀 گروه شما", "channel": "📢 کانال شما", "bot": "🤖 ربات شما"}
+
+REPORT_FOOTER = (
+    "👑 @MahdiViewStarVIP 🦁\n"
+    "🥇 @MahdiiwX\n"
+    "🥈 @mershadabasi\n\n"
+    "💎 رضایتت از مهدی ویو استار | 𝑽𝑰𝑷 ؟\n\n"
+    "مرسی که انتخابت ما بودیم 🖤👽"
+)
+
+
+def format_report_duration(seconds: int) -> str:
+    """مدت جوین اجباری برای کپشن: همیشه به ساعت (24 ساعت ، 48 ساعت)؛ کمتر از یک ساعت = دقیقه."""
+    if seconds < 3600:
+        return f"{max(seconds // 60, 1)} دقیقه"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours} ساعت" if not minutes else f"{hours} ساعت و {minutes} دقیقه"
+
+
+def build_report_caption(item: dict, reason: str, joined: int) -> str:
+    """کپشن گزارش پایان جوین اجباری؛ قالب ممبری برای آیتم‌های تعرفه‌دار، قالب ساعتی برای آیتم‌های زمانی."""
+    kind = item.get("kind", "channel")
+    target_line = f"{REPORT_KIND_LINE.get(kind, REPORT_KIND_LINE['channel'])} : {html.escape(item['title'])}"
+    limit = item_member_limit(item)
+    duration_seconds = item.get("duration_seconds")
+
+    if limit > 0 and reason != "expired":
+        header = f"🔓 تکمیل ممبری جوین اجباری : {limit}"
+    elif isinstance(duration_seconds, int) and duration_seconds > 0:
+        header = (
+            f"مدت جوین اجباری : {format_report_duration(duration_seconds)} 🔒\n\n"
+            f"تعداد جذبت : {joined:02d}🔋"
+        )
+    else:
+        return (
+            f"📊 <b>{html.escape(item['title'])}</b>\n"
+            f"✅ ممبر جذب‌شده از طریق ربات: <b>{joined:,}</b>\n"
+            f"🏁 {REPORT_REASON_LABEL.get(reason, REPORT_REASON_LABEL['expired'])}"
+        )
+    return f"سلام جوین اجباریت به پایان رسید⏳️\n\n{header}\n\n{target_line}\n\n{REPORT_FOOTER}"
+
+
 async def send_item_report(bot, item: dict, reason: str = "expired", claim: bool = True, recipients=None) -> bool:
     """
     گزارش تصویری «قبل و بعد» را برای ادمین‌های ربات می‌فرستد.
@@ -1343,11 +1394,7 @@ async def send_item_report(bot, item: dict, reason: str = "expired", claim: bool
         return False
 
     joined = max((await fetch_member_count(bot, item) or 0) + get_fake_members(item), 0)  # مطابق عدد سبز تصویر
-    caption = (
-        f"📊 <b>{html.escape(item['title'])}</b>\n"
-        f"✅ ممبر جذب‌شده از طریق ربات: <b>{joined:,}</b>\n"
-        f"🏁 {REPORT_REASON_LABEL.get(reason, REPORT_REASON_LABEL['expired'])}"
-    )
+    caption = build_report_caption(item, reason, joined)
     sent_any = False
     for uid in (recipients if recipients is not None else REPORT_RECIPIENT_IDS):
         for attempt in range(2):
@@ -1641,6 +1688,28 @@ QUOTA_PROMPT = (
 )
 
 
+def added_message(kind: str, title: str) -> str:
+    """متن تأیید افزودن آیتم به جوین اجباری (HTML-safe)."""
+    safe_title = html.escape(title)
+    if kind == "channel":
+        return (
+            "⚡️ <b>سیستم جوین اجباری فعال شد!</b>\n"
+            f"📢 کانال «{safe_title}» با موفقیت به لیست عضویت اجباری اضافه شد.\n"
+            "🔐 وضعیت: فعال 🔋"
+        )
+    if kind == "group":
+        return (
+            "گروه با موفقیت به جوین اجباری اضافه شد ! 🔒\n\n"
+            f"📌 نام گروه: «{safe_title}»\n\n"
+            "وضعیت جوین اجباری : فعال 🔋"
+        )
+    return (
+        "🤖 <b>سیستم ربات با موفقیت فعال شد!</b>\n"
+        f"📡 ربات «{safe_title}» با موفقیت به سیستم جوین اجباری اضافه شد. 🔐\n"
+        "وضعیت: فعال 🔋"
+    )
+
+
 def parse_member_limit(text: str) -> Optional[int]:
     """عدد صحیح غیرمنفی (ارقام فارسی/عربی و جداکننده‌ی هزارگان پشتیبانی می‌شود)؛ نامعتبر = None."""
     cleaned = (text or "").translate(_PERSIAN_DIGITS).strip().replace(",", "").replace("٬", "").replace(" ", "")
@@ -1798,13 +1867,15 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             if added:
                 PENDING_ITEM_QUOTA[user_id] = (added["id"], True)
                 await message.reply_text(
-                    f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅\n\n"
+                    added_message(kind, chat_full.title) + "\n\n"
                     + QUOTA_PROMPT.format(title=html.escape(chat_full.title)),
                     parse_mode=ParseMode.HTML,
                 )
             else:
                 await message.reply_text(
-                    f"{KIND_LABEL[kind]} «{chat_full.title}» با موفقیت اضافه شد ✅", reply_markup=CHANNELS_MENU
+                    added_message(kind, chat_full.title),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=CHANNELS_MENU,
                 )
 
         origin = message.forward_origin
@@ -1911,15 +1982,15 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
         if added:
             PENDING_ITEM_QUOTA[user_id] = (added["id"], True)
             await message.reply_text(
-                f"ربات «{title}» اضافه شد ✅\n"
-                f"لینک استارت: {deep_link}\n\n"
+                added_message("bot", title) + "\n\n"
                 + QUOTA_PROMPT.format(title=html.escape(title)),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         else:
             await message.reply_text(
-                f"ربات «{title}» اضافه شد ✅\nلینک استارت: {deep_link}",
+                added_message("bot", title),
+                parse_mode=ParseMode.HTML,
                 reply_markup=CHANNELS_MENU,
                 disable_web_page_preview=True,
             )
@@ -1984,7 +2055,7 @@ async def owner_private_message(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         PENDING_ITEM_TIME.pop(user_id, None)
-        err = await set_item_expiry(item_id, datetime.now(timezone.utc) + delta)
+        err = await set_item_expiry(item_id, datetime.now(timezone.utc) + delta, duration=delta)
         if err:
             await message.reply_text(f"❌ ذخیره نشد:\n{err}")
             return
