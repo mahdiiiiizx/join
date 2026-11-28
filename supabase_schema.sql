@@ -25,6 +25,7 @@ alter table channels add column if not exists quota_done boolean not null defaul
 alter table channels add column if not exists peak_members bigint not null default 0;
 alter table channels add column if not exists fake_members bigint not null default 0;
 alter table channels add column if not exists report_sent boolean not null default false;
+alter table channels add column if not exists duration_seconds bigint;
 
 create table if not exists bot_starts (
     bot_username text not null,
